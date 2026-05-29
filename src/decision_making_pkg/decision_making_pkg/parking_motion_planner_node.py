@@ -1,375 +1,215 @@
-#!/usr/bin/env python3
-"""
-parking_motion_planner_node.py
-
-굴절 차량 후진 주차용 motion planner.
-
-입력
-----
-- path_planning_result (interfaces_pkg/msg/PathPlanningResult)
-    parking_path_planner_node가 발행하는 픽셀 좌표 기반 Bézier 경로.
-    path[0]은 left/right 마커 중점(현재 차량 기준점), path[-1]은 parking 중심점.
-- /articulation/angle (std_msgs/msg/Float32)
-    A0 굴절부 센서로 계산한 굴절각 [deg].
-- /parking/complete (std_msgs/msg/Bool)
-    left/right 마커가 parking 영역 내부에 들어왔는지에 대한 완료 신호.
-
-출력
-----
-- topic_control_signal (interfaces_pkg/msg/MotionCommand)
-    serial_sender_node를 거쳐 Arduino에 전달될 조향/모터 명령.
-
-중요
-----
-- 실제 조향 좌우 방향은 카메라 장착 방향, Arduino 조향 부호에 따라 달라질 수 있다.
-  처음 바퀴를 띄운 상태에서 steering_sign:=1.0 또는 -1.0을 확인해야 한다.
-- 주차 완료는 기본적으로 /parking/complete가 True가 되었을 때 판단한다.
-- use_distance_completion을 True로 설정한 경우에만 과거 픽셀 거리 기준 정지도 함께 사용한다.
-"""
-
-import math
-from typing import List, Optional, Tuple
-
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import (
-    QoSDurabilityPolicy,
-    QoSHistoryPolicy,
-    QoSProfile,
-    QoSReliabilityPolicy,
-)
-from std_msgs.msg import Bool, Float32
+from rclpy.qos import QoSProfile
+from rclpy.qos import QoSHistoryPolicy
+from rclpy.qos import QoSDurabilityPolicy
+from rclpy.qos import QoSReliabilityPolicy
 
-from interfaces_pkg.msg import MotionCommand, PathPlanningResult
+import math
+from std_msgs.msg import String, Bool, Float32  # 포텐쇼미터 데이터용 Float32
+from interfaces_pkg.msg import PathPlanningResult, DetectionArray, MotionCommand
+from .lib import decision_making_func_lib as DMFL
+
+#---------------Variable Setting---------------
+SUB_DETECTION_TOPIC_NAME = "detections"
+SUB_PATH_TOPIC_NAME = "path_planning_result"
+SUB_HITCH_TOPIC_NAME = "/articulation/angle"    # serial_sender_node 포텐쇼미터 각도 토픽
+SUB_TRAFFIC_LIGHT_TOPIC_NAME = "yolov8_traffic_light_info"
+SUB_LIDAR_OBSTACLE_TOPIC_NAME = "lidar_obstacle_info"
+PUB_TOPIC_NAME = "topic_control_signal"
+
+#----------------------------------------------
+
+# 모션 플랜 발행 주기 (초)
+TIMER = 0.1
+
+# 기본 CONSTANTS (기존 제어 틀 유지)
+MAX_STEP = 7
+THETA_MAX_DEG = 75.0  
+ALPHA = 0.3
+MAX_STEP_DELTA = 1
+
+# 🌟 트레일러 픽셀 뷰 후진 전용 제어 게인 및 안전 한계선
+K_LATERAL = 0.5        # 픽셀 오차 각도를 목표 꺾임각으로 변환하는 게인 (실차 튜닝 필요)
+K_HITCH = 0.6          # 꺾임각 오차를 조향 스텝으로 변환하는 게인
+JACKKNIFE_LIMIT = 35.0  # 잭나이프 현상 방지 한계 각도 (도 단위)
+REVERSE_SPEED = -0   # 후진 구동 속도 (하드웨어 모터 스펙에 맞게 부호/크기 설정)
 
 
-Point = Tuple[float, float]
+class MotionPlanningNode(Node):
+    def __init__(self):
+        super().__init__('motion_planner_node')
 
+        # 토픽 이름 설정
+        self.sub_detection_topic = self.declare_parameter('sub_detection_topic', SUB_DETECTION_TOPIC_NAME).value
+        self.sub_path_topic = self.declare_parameter('sub_lane_topic', SUB_PATH_TOPIC_NAME).value
+        self.sub_hitch_topic = self.declare_parameter('sub_hitch_topic', SUB_HITCH_TOPIC_NAME).value  
+        # self.sub_traffic_light_topic = self.declare_parameter('sub_traffic_light_topic', SUB_TRAFFIC_LIGHT_TOPIC_NAME).value
+        # self.sub_lidar_obstacle_topic = self.declare_parameter('sub_lidar_obstacle_topic', SUB_LIDAR_OBSTACLE_TOPIC_NAME).value
+        self.pub_topic = self.declare_parameter('pub_topic', PUB_TOPIC_NAME).value
+        
+        self.timer_period = self.declare_parameter('timer', TIMER).value
 
-class ParkingMotionPlannerNode(Node):
-    """Generate low-speed reverse commands for articulated-vehicle parking."""
-
-    def __init__(self) -> None:
-        super().__init__("parking_motion_planner_node")
-
-        # Topics
-        self.path_topic = self.declare_parameter(
-            "path_topic", "path_planning_result"
-        ).value
-        self.articulation_topic = self.declare_parameter(
-            "articulation_topic", "/articulation/angle"
-        ).value
-        self.command_topic = self.declare_parameter(
-            "command_topic", "topic_control_signal"
-        ).value
-        self.completion_topic = self.declare_parameter(
-            "completion_topic", "/parking/complete"
-        ).value
-
-        # Control frequency / data validity
-        self.timer_period = float(self.declare_parameter("timer", 0.10).value)
-        self.path_timeout_sec = float(
-            self.declare_parameter("path_timeout_sec", 0.50).value
-        )
-        self.articulation_timeout_sec = float(
-            self.declare_parameter("articulation_timeout_sec", 0.50).value
-        )
-        self.require_articulation = bool(
-            self.declare_parameter("require_articulation", True).value
-        )
-
-        # Steering control
-        self.max_steering_step = int(
-            self.declare_parameter("max_steering_step", 7).value
-        )
-        self.max_step_delta = int(
-            self.declare_parameter("max_step_delta", 1).value
-        )
-        self.lookahead_index = int(
-            self.declare_parameter("lookahead_index", 8).value
-        )
-        self.turn_deadband_deg = float(
-            self.declare_parameter("turn_deadband_deg", 2.0).value
-        )
-        self.turn_angle_for_max_step_deg = float(
-            self.declare_parameter("turn_angle_for_max_step_deg", 35.0).value
-        )
-        self.steering_sign = float(
-            self.declare_parameter("steering_sign", 1.0).value
-        )
-        self.steering_lpf_alpha = float(
-            self.declare_parameter("steering_lpf_alpha", 0.35).value
-        )
-
-        # Optional articulation correction:
-        # 0.0 keeps the first test safe until the real corrective sign is verified.
-        self.articulation_gain = float(
-            self.declare_parameter("articulation_gain", 0.0).value
-        )
-
-        # Reverse speed / stopping conditions
-        self.reverse_speed = int(
-            self.declare_parameter("reverse_speed", -30).value
-        )
-        self.slow_reverse_speed = int(
-            self.declare_parameter("slow_reverse_speed", -18).value
-        )
-        self.slow_turn_angle_deg = float(
-            self.declare_parameter("slow_turn_angle_deg", 18.0).value
-        )
-        self.articulation_warning_deg = float(
-            self.declare_parameter("articulation_warning_deg", 22.0).value
-        )
-        self.articulation_stop_deg = float(
-            self.declare_parameter("articulation_stop_deg", 32.0).value
-        )
-        # Marker-inside completion is the default. Pixel distance is retained only as an optional fallback.
-        self.use_distance_completion = bool(
-            self.declare_parameter("use_distance_completion", False).value
-        )
-        self.stop_distance_px = float(
-            self.declare_parameter("stop_distance_px", 25.0).value
-        )
-
+        # QoS 설정
         self.qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1,
+            depth=1
         )
 
-        # Latest input state
-        self.path_data: Optional[List[Point]] = None
-        self.path_received_time = None
-        self.articulation_angle: Optional[float] = None
-        self.articulation_received_time = None
-        self.parking_complete = False
+        # 변수 초기화
+        self.detection_data = None
+        self.path_data = None
+        # self.traffic_light_data = None
+        # self.lidar_data = None
 
-        # Command state for LPF / slew limit
-        self.filtered_turn_angle = 0.0
-        self.previous_steering_step = 0
-        self.last_state = ""
+        self.steering_command = 0
+        self.left_speed_command = 0
+        self.right_speed_command = 0
 
-        self.path_sub = self.create_subscription(
-            PathPlanningResult,
-            self.path_topic,
-            self.path_callback,
-            self.qos_profile,
-        )
-        self.articulation_sub = self.create_subscription(
-            Float32,
-            self.articulation_topic,
-            self.articulation_callback,
-            self.qos_profile,
-        )
-        self.completion_sub = self.create_subscription(
-            Bool,
-            self.completion_topic,
-            self.completion_callback,
-            self.qos_profile,
-        )
-        self.command_pub = self.create_publisher(
-            MotionCommand,
-            self.command_topic,
-            self.qos_profile,
-        )
+        # 추가 변수 설정
+        self.current_hitch_angle = 0.0  # 실시간 포텐쇼미터 데이터 (도 단위)
+        self.target_slope_f = 0.0
+        self.prev_step = 0
+        self.cnt_dead = 0
+
+        # 서브스크라이버 설정
+        self.detection_sub = self.create_subscription(DetectionArray, self.sub_detection_topic, self.detection_callback, self.qos_profile)
+        self.path_sub = self.create_subscription(PathPlanningResult, self.sub_path_topic, self.path_callback, self.qos_profile)
+        self.hitch_sub = self.create_subscription(Float32, self.sub_hitch_topic, self.hitch_callback, self.qos_profile) 
+        # self.traffic_light_sub = self.create_subscription(String, self.sub_traffic_light_topic, self.traffic_light_callback, self.qos_profile)
+        # self.lidar_sub = self.create_subscription(Bool, self.sub_lidar_obstacle_topic, self.lidar_callback, self.qos_profile)
+
+        # 퍼블리셔 설정
+        self.publisher = self.create_publisher(MotionCommand, self.pub_topic, self.qos_profile)
+
+        # 타이머 설정
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
 
-        self.get_logger().info(
-            "Parking motion planner started: "
-            f"path={self.path_topic}, articulation={self.articulation_topic}, "
-            f"complete={self.completion_topic}, command={self.command_topic}, "
-            f"reverse_speed={self.reverse_speed}"
-        )
-        self.get_logger().warn(
-            "First test must be performed with wheels lifted or motor speed limited; "
-            "verify steering_sign before ground driving."
-        )
+    def detection_callback(self, msg: DetectionArray):
+        self.detection_data = msg
 
-    def path_callback(self, msg: PathPlanningResult) -> None:
-        if len(msg.x_points) != len(msg.y_points):
-            self.get_logger().warn("Ignored invalid path: x_points/y_points length mismatch.")
+    def path_callback(self, msg: PathPlanningResult):
+        self.path_data = list(zip(msg.x_points, msg.y_points))
+
+    def hitch_callback(self, msg: Float32):
+        self.current_hitch_angle = msg.data
+                
+    def timer_callback(self):
+        # 1. 경로 데이터가 아예 없는 경우 (안전을 위해 즉시 정지)
+        if self.path_data is None:
+            self.steering_command = 0
+            self.left_speed_command = 0
+            self.right_speed_command = 0
+            self.get_logger().warn("---------Path data none!!!---------")
+            self.publish_motion_command()
             return
-
-        self.path_data = [
-            (float(x), float(y)) for x, y in zip(msg.x_points, msg.y_points)
-        ]
-        self.path_received_time = self.get_clock().now()
-
-    def articulation_callback(self, msg: Float32) -> None:
-        self.articulation_angle = float(msg.data)
-        self.articulation_received_time = self.get_clock().now()
-
-    def completion_callback(self, msg: Bool) -> None:
-        self.parking_complete = bool(msg.data)
-
-    def age_seconds(self, stamp) -> float:
-        if stamp is None:
-            return float("inf")
-        return (self.get_clock().now() - stamp).nanoseconds / 1.0e9
-
-    @staticmethod
-    def distance(point_a: Point, point_b: Point) -> float:
-        return math.hypot(point_b[0] - point_a[0], point_b[1] - point_a[1])
-
-    @staticmethod
-    def signed_angle_between(vector_a: Point, vector_b: Point) -> float:
-        """Return signed smallest angle from a to b in degrees."""
-        cross = vector_a[0] * vector_b[1] - vector_a[1] * vector_b[0]
-        dot = vector_a[0] * vector_b[0] + vector_a[1] * vector_b[1]
-        return math.degrees(math.atan2(cross, dot))
-
-    def calculate_path_turn_angle(self, path: List[Point]) -> Optional[float]:
-        """
-        Measure how the new Bézier path bends immediately ahead of the marker center.
-
-        Local tangent: path[1] - path[0]
-        Look-ahead direction: path[index] - path[0]
-        Positive/negative value indicates curve direction in image coordinates.
-        """
-        if len(path) < 3:
-            return None
-
-        index = max(2, min(self.lookahead_index, len(path) - 1))
-        local_vector = (path[1][0] - path[0][0], path[1][1] - path[0][1])
-        ahead_vector = (path[index][0] - path[0][0], path[index][1] - path[0][1])
-
-        if math.hypot(*local_vector) < 1.0e-6 or math.hypot(*ahead_vector) < 1.0e-6:
-            return None
-
-        return self.signed_angle_between(local_vector, ahead_vector)
-
-    def reset_steering(self) -> None:
-        self.filtered_turn_angle = 0.0
-        self.previous_steering_step = 0
-
-    def publish_command(self, steering: int, speed: int, state: str) -> None:
-        command = MotionCommand()
-        command.steering = int(steering)
-        command.left_speed = int(speed)
-        command.right_speed = int(speed)
-        self.command_pub.publish(command)
-
-        if state != self.last_state:
-            self.get_logger().info(
-                f"parking_state={state}, steering={steering}, speed={speed}, "
-                f"articulation={self.articulation_angle}"
-            )
-            self.last_state = state
-
-    def publish_stop(self, state: str) -> None:
-        self.reset_steering()
-        self.publish_command(0, 0, state)
-
-    def compute_steering_step(self, path_turn_angle: float) -> int:
-        if abs(path_turn_angle) < self.turn_deadband_deg:
-            path_turn_angle = 0.0
-
-        self.filtered_turn_angle = (
-            (1.0 - self.steering_lpf_alpha) * self.filtered_turn_angle
-            + self.steering_lpf_alpha * path_turn_angle
-        )
-
-        # Path bend contribution. steering_sign is intentionally configurable.
-        steering_float = (
-            self.steering_sign
-            * self.filtered_turn_angle
-            / self.turn_angle_for_max_step_deg
-            * self.max_steering_step
-        )
-
-        # Disabled by default until the correction direction is calibrated on the vehicle.
-        if self.articulation_angle is not None:
-            steering_float += self.articulation_gain * self.articulation_angle
-
-        desired_step = int(round(steering_float))
-        desired_step = max(
-            -self.max_steering_step, min(self.max_steering_step, desired_step)
-        )
-
-        # Do not command abrupt full-lock steering between timer cycles.
-        limited_step = max(
-            self.previous_steering_step - self.max_step_delta,
-            min(self.previous_steering_step + self.max_step_delta, desired_step),
-        )
-        self.previous_steering_step = limited_step
-        return limited_step
-
-    def timer_callback(self) -> None:
-        # 0. Primary parking-complete condition: both left/right markers are inside parking.
-        if self.parking_complete:
-            self.publish_stop("PARKING_COMPLETE_MARKERS_INSIDE")
+    
+        # 경로 점이 너무 부족한 경우 (Lookahead 타겟팅 불가하므로 안전 속도로 직선 후진)
+        elif len(self.path_data) < 10:
+            self.cnt_dead += 1
+            if self.cnt_dead > 30:
+                self.get_logger().info("Dead reckoning mode - Safe Straight Reversing")
+                self.steering_command = 0
+                self.left_speed_command = REVERSE_SPEED
+                self.right_speed_command = REVERSE_SPEED
+                self.publish_motion_command()
             return
+    
+        # 2. 정상 트레일러 동적 패스 추종 및 이중 루프 제어 가동
+        else:
+            self.cnt_dead = 0
 
-        # 1. Stop if path detections disappear or stale path remains in memory.
-        if self.path_data is None or self.age_seconds(self.path_received_time) > self.path_timeout_sec:
-            self.publish_stop("STOP_PATH_TIMEOUT")
-            return
-
-        if len(self.path_data) < 3:
-            self.publish_stop("STOP_INVALID_PATH")
-            return
-
-        # 2. For articulated parking, do not reverse without a current articulation reading.
-        if self.require_articulation:
-            if (
-                self.articulation_angle is None
-                or self.age_seconds(self.articulation_received_time)
-                > self.articulation_timeout_sec
-            ):
-                self.publish_stop("STOP_ARTICULATION_TIMEOUT")
+            # 🚨 [비상 안전장치] 잭나이프 한계 도달 시 즉시 정지하여 물리적 파손 방지
+            if abs(self.current_hitch_angle) > JACKKNIFE_LIMIT:
+                self.get_logger().error(f"🚨 JACKKNIFE WARNING! Angle: {self.current_hitch_angle:.1f}°")
+                self.steering_command = 0
+                self.left_speed_command = 0
+                self.right_speed_command = 0
+                self.publish_motion_command()
                 return
 
-        # 3. Hard jackknife prevention.
-        if (
-            self.articulation_angle is not None
-            and abs(self.articulation_angle) >= self.articulation_stop_deg
-        ):
-            self.publish_stop("STOP_ARTICULATION_LIMIT")
-            return
+            # ----------------------------------------------------------------------
+            # [외곽 루프 (Outer Loop)] 🌟 이미지 픽셀 매칭형 목표 각도 추출
+            # ----------------------------------------------------------------------
+            # 패스의 시작점 (트레일러 본네트 노란 점 픽셀)
+            origin_x = self.path_data[0][0]
+            origin_y = self.path_data[0][1]
 
-        # 4. Optional fallback only: previous pixel-distance completion rule.
-        # Disabled by default because final stop should depend on left/right being inside parking.
-        if self.use_distance_completion:
-            remaining_distance = self.distance(self.path_data[0], self.path_data[-1])
-            if remaining_distance <= self.stop_distance_px:
-                self.publish_stop("PARKING_COMPLETE_DISTANCE_FALLBACK")
-                return
+            # 가이드라인 상에서 쫓아갈 앞쪽 목표점 선정 (15번째 픽셀 점 타겟팅)
+            LOOKAHEAD_INDEX = min(15, len(self.path_data) - 1)
+            target_point = self.path_data[LOOKAHEAD_INDEX]
+            
+            # 픽셀 좌표 오차 계산
+            dx = target_point[0] - origin_x
+            # 픽셀 좌표계는 상단이 0이므로, 전방 진행 방향을 양수(+)로 만들기 위해 부호 반전
+            dy = origin_y - target_point[1]  
 
-        # 5. Calculate steering demand from path curvature.
-        path_turn_angle = self.calculate_path_turn_angle(self.path_data)
-        if path_turn_angle is None:
-            self.publish_stop("STOP_PATH_GEOMETRY")
-            return
+            if abs(dy) > 1e-5:
+                # 🔄 트레일러 후진 역조향 기하학 매핑:
+                # 목표점이 우측(dx > 0)에 있으면 트레일러 뒷무릎을 우측으로 밀기 위해
+                # 목표 꺾임각(gamma_ref)이 음수(-)가 되어 견인차가 왼쪽으로 꺾도록 마이너스(-) 부착
+                target_angle = -math.degrees(math.atan2(dx, dy))
+            else:
+                target_angle = 0.0
 
-        steering_step = self.compute_steering_step(path_turn_angle)
+            # 미세 픽셀 흔들림 필터링 데드존 (1.5도 미만 컷)
+            if abs(target_angle) < 1.5:
+                target_angle = 0.0
 
-        # 6. Slow reverse if a sharp curve or increasing articulation is seen.
-        should_slow = abs(path_turn_angle) >= self.slow_turn_angle_deg
-        if self.articulation_angle is not None:
-            should_slow = should_slow or (
-                abs(self.articulation_angle) >= self.articulation_warning_deg
-            )
+            # 목표 꺾임각(gamma_ref) 산출 및 과도한 접힘 방지 제한 (최대 15도)
+            gamma_ref = K_LATERAL * target_angle
+            gamma_ref = max(-15.0, min(15.0, gamma_ref))
 
-        speed = self.slow_reverse_speed if should_slow else self.reverse_speed
-        state = "REVERSE_SLOW" if should_slow else "REVERSE_TRACKING"
-        self.publish_command(steering_step, speed, state)
+            # ----------------------------------------------------------------------
+            # [내부 루프 (Inner Loop)] 🌟 목표 꺾임각 추종을 위한 포텐쇼미터 피드백 제어
+            # ----------------------------------------------------------------------
+            hitch_error = gamma_ref - self.current_hitch_angle
+        
+            # 기존 8조 알고리즘의 조향 필터 메커니즘 원본 그대로 계승 (LPF 적용)
+            self.target_slope_f = (1 - ALPHA) * self.target_slope_f + ALPHA * hitch_error
+            
+            # P 제어 기반 최종 조향 스텝 명령 산출
+            step_f = K_HITCH * self.target_slope_f
+            step = int(round(step_f))
+            step = max(-MAX_STEP, min(MAX_STEP, step))
+            
+            # Slew Rate Limiter (갑작스러운 핸들 털림 및 잭나이프 가속 방지)
+            step = max(self.prev_step - MAX_STEP_DELTA, min(self.prev_step + MAX_STEP_DELTA, step))
+            self.prev_step = step
+            self.steering_command = step
 
-    def stop_vehicle(self) -> None:
-        self.publish_stop("SHUTDOWN_STOP")
+            # 속도 결정 (안전 후진 상수 고정)
+            self.left_speed_command = REVERSE_SPEED
+            self.right_speed_command = REVERSE_SPEED
+
+        # 실시간 제어 데이터 로깅
+        self.get_logger().info(f"[PIXEL TRAILER] TargetAng: {target_angle:.1f}° | "
+                               f"GammaRef: {gamma_ref:.1f}° | Hitch: {self.current_hitch_angle:.1f}° | "
+                               f"SteerStep: {self.steering_command}")
+
+        self.publish_motion_command()
+
+    def publish_motion_command(self):
+        # 모션 명령 메시지 생성 및 퍼블리시
+        motion_command_msg = MotionCommand()
+        motion_command_msg.steering = self.steering_command
+        motion_command_msg.left_speed = self.left_speed_command
+        motion_command_msg.right_speed = self.right_speed_command
+        self.publisher.publish(motion_command_msg)
 
 
-def main(args=None) -> None:
+def main(args=None):
     rclpy.init(args=args)
-    node = ParkingMotionPlannerNode()
+    node = MotionPlanningNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.stop_vehicle()
+        print("\n\nshutdown\n\n")
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
