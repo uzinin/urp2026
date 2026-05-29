@@ -1,208 +1,169 @@
 import time
-import serial
+from typing import Optional
+
 import rclpy
-
+import serial
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
-from rclpy.qos import QoSHistoryPolicy
-from rclpy.qos import QoSDurabilityPolicy
-from rclpy.qos import QoSReliabilityPolicy
-
-from std_msgs.msg import Int32
-from std_msgs.msg import Float32
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy, QoSReliabilityPolicy
+from std_msgs.msg import Float32, Int32
 
 from interfaces_pkg.msg import MotionCommand
 from .lib import protocol_convert_func_lib as PCFL
 
 
-#---------------Variable Setting---------------
-# Subscribe할 토픽 이름
 SUB_TOPIC_NAME = "topic_control_signal"
-
-# 아두이노 장치 이름
-PORT = '/dev/ttyACM0'
+PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 
-# 굴절부 토픽 이름
 ARTICULATION_RAW_TOPIC = "/articulation/potentiometer_raw"
 ARTICULATION_ANGLE_TOPIC = "/articulation/angle"
-#----------------------------------------------
 
 
 class SerialSenderNode(Node):
-    def __init__(self, sub_topic=SUB_TOPIC_NAME):
-        super().__init__('serial_sender_node')
+    """Send motion commands to Arduino and publish A0 articulation measurements."""
 
-        self.declare_parameter('sub_topic', sub_topic)
-        self.declare_parameter('port', PORT)
-        self.declare_parameter('baud_rate', BAUD_RATE)
+    def __init__(self, sub_topic: str = SUB_TOPIC_NAME) -> None:
+        super().__init__("serial_sender_node")
 
-        # 굴절각 보정 파라미터
-        # 실제 차량에서 측정 후 수정하세요.
-        self.declare_parameter('adc_min', 60)
-        self.declare_parameter('adc_max', 240)
-        self.declare_parameter('angle_min_deg', -40.0)
-        self.declare_parameter('angle_max_deg', 40.0)
+        self.declare_parameter("sub_topic", sub_topic)
+        self.declare_parameter("port", PORT)
+        self.declare_parameter("baud_rate", BAUD_RATE)
 
-        self.sub_topic = self.get_parameter('sub_topic').get_parameter_value().string_value
-        self.port = self.get_parameter('port').get_parameter_value().string_value
-        self.baud_rate = self.get_parameter('baud_rate').get_parameter_value().integer_value
+        # Set these four calibration values after physically measuring A0.
+        self.declare_parameter("articulation_adc_min", 60)
+        self.declare_parameter("articulation_adc_max", 240)
+        self.declare_parameter("articulation_angle_min_deg", -40.0)
+        self.declare_parameter("articulation_angle_max_deg", 40.0)
 
-        self.adc_min = self.get_parameter('adc_min').get_parameter_value().integer_value
-        self.adc_max = self.get_parameter('adc_max').get_parameter_value().integer_value
-        self.angle_min_deg = self.get_parameter('angle_min_deg').get_parameter_value().double_value
-        self.angle_max_deg = self.get_parameter('angle_max_deg').get_parameter_value().double_value
+        self.sub_topic = self.get_parameter("sub_topic").value
+        self.port = self.get_parameter("port").value
+        self.baud_rate = int(self.get_parameter("baud_rate").value)
+        self.adc_min = int(self.get_parameter("articulation_adc_min").value)
+        self.adc_max = int(self.get_parameter("articulation_adc_max").value)
+        self.angle_min_deg = float(self.get_parameter("articulation_angle_min_deg").value)
+        self.angle_max_deg = float(self.get_parameter("articulation_angle_max_deg").value)
+
+        if self.adc_max <= self.adc_min:
+            raise ValueError("articulation_adc_max must be greater than articulation_adc_min")
 
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1
+            depth=10,
         )
 
-        # Serial 연결
-        self.ser = serial.Serial(self.port, self.baud_rate, timeout=0.01)
-        time.sleep(1)
+        self.ser = serial.Serial(self.port, self.baud_rate, timeout=0.0)
+        time.sleep(1.0)  # Arduino may reset when the serial port is opened.
+        self.ser.reset_input_buffer()
+        self._serial_buffer = ""
 
-        self.get_logger().info(f"Connected to Arduino: {self.port}")
-
-        # 주행 명령 Subscribe
         self.subscription = self.create_subscription(
-            MotionCommand,
-            self.sub_topic,
-            self.data_callback,
-            qos_profile
+            MotionCommand, self.sub_topic, self.data_callback, qos_profile
         )
-
-        # 굴절부 가변저항 Publish
         self.articulation_raw_pub = self.create_publisher(
-            Int32,
-            ARTICULATION_RAW_TOPIC,
-            qos_profile
+            Int32, ARTICULATION_RAW_TOPIC, qos_profile
         )
-
         self.articulation_angle_pub = self.create_publisher(
-            Float32,
-            ARTICULATION_ANGLE_TOPIC,
-            qos_profile
+            Float32, ARTICULATION_ANGLE_TOPIC, qos_profile
         )
-
-        # Arduino에서 들어오는 Serial 데이터 읽기용 타이머
         self.serial_read_timer = self.create_timer(0.01, self.read_serial_callback)
 
-    def data_callback(self, msg):
-        steering = msg.steering
-        left_speed = msg.left_speed
-        right_speed = msg.right_speed
+        self.get_logger().info(
+            f"Connected to Arduino on {self.port} at {self.baud_rate} baud; "
+            "receiving A0 articulation telemetry."
+        )
 
+    def data_callback(self, msg: MotionCommand) -> None:
+        """Transmit steering and driving commands using the existing command protocol."""
         serial_msg = PCFL.convert_serial_message(
-            steering,
-            left_speed,
-            right_speed
+            msg.steering, msg.left_speed, msg.right_speed
         )
-
-        self.ser.write(serial_msg.encode())
-
-    def adc_to_angle(self, adc_value):
-        """
-        굴절부 ADC 값을 각도(degree)로 변환.
-        현재는 선형 변환 방식.
-        """
-
-        if adc_value < self.adc_min:
-            adc_value = self.adc_min
-        elif adc_value > self.adc_max:
-            adc_value = self.adc_max
-
-        ratio = (adc_value - self.adc_min) / (self.adc_max - self.adc_min)
-
-        angle_deg = self.angle_min_deg + ratio * (
-            self.angle_max_deg - self.angle_min_deg
-        )
-
-        return angle_deg
-
-    def read_serial_callback(self):
-        """
-        Arduino에서 들어오는 데이터를 읽음.
-        Arduino가 a512 형태로 보내면 굴절부 센서값으로 처리.
-        """
-
+        if not serial_msg.endswith("\n"):
+            serial_msg += "\n"
         try:
-            while self.ser.in_waiting > 0:
-                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+            self.ser.write(serial_msg.encode("ascii"))
+        except serial.SerialException as exc:
+            self.get_logger().error(f"Serial write error: {exc}")
 
-                if line == "":
-                    return
+    def adc_to_angle(self, adc_value: int) -> float:
+        adc_limited = max(self.adc_min, min(self.adc_max, adc_value))
+        ratio = (adc_limited - self.adc_min) / (self.adc_max - self.adc_min)
+        return self.angle_min_deg + ratio * (self.angle_max_deg - self.angle_min_deg)
 
-                # 굴절부 가변저항 데이터 예: a512
-                if line.startswith("a"):
-                    adc_value = int(line[1:])
+    def publish_articulation(self, line: str) -> None:
+        """Parse Arduino telemetry formatted as a<ADC>, for example a512."""
+        if not line.startswith("a"):
+            self.get_logger().debug(f"Ignored Arduino message: {line}")
+            return
 
-                    raw_msg = Int32()
-                    raw_msg.data = adc_value
-                    self.articulation_raw_pub.publish(raw_msg)
-
-                    angle_deg = self.adc_to_angle(adc_value)
-
-                    angle_msg = Float32()
-                    angle_msg.data = float(angle_deg)
-                    self.articulation_angle_pub.publish(angle_msg)
-
-                    self.get_logger().info(
-                        f"Articulation ADC: {adc_value}, angle: {angle_deg:.2f} deg"
-                    )
-
-                else:
-                    self.get_logger().debug(f"Arduino message: {line}")
-
+        payload = line[1:].strip()
+        try:
+            adc_value = int(payload)
         except ValueError:
-            self.get_logger().warn(f"Invalid articulation data: {line}")
+            self.get_logger().warning(f"Invalid articulation packet: {line!r}")
+            return
 
-        except Exception as e:
-            self.get_logger().error(f"Serial read error: {e}")
+        if not 0 <= adc_value <= 1023:
+            self.get_logger().warning(f"Out-of-range articulation ADC value: {adc_value}")
+            return
 
-    def stop_vehicle(self):
-        steering = 0
-        left_speed = 0
-        right_speed = 0
+        raw_msg = Int32()
+        raw_msg.data = adc_value
+        self.articulation_raw_pub.publish(raw_msg)
 
-        message = PCFL.convert_serial_message(
-            steering,
-            left_speed,
-            right_speed
-        )
+        angle_msg = Float32()
+        angle_msg.data = float(self.adc_to_angle(adc_value))
+        self.articulation_angle_pub.publish(angle_msg)
 
-        self.ser.write(message.encode())
+    def read_serial_callback(self) -> None:
+        """Read complete newline-terminated packets without parsing partial lines."""
+        try:
+            waiting = self.ser.in_waiting
+            if waiting <= 0:
+                return
 
-    def close_serial(self):
+            self._serial_buffer += self.ser.read(waiting).decode("ascii", errors="ignore")
+            while "\n" in self._serial_buffer:
+                line, self._serial_buffer = self._serial_buffer.split("\n", 1)
+                line = line.strip("\r ")
+                if line:
+                    self.publish_articulation(line)
+        except serial.SerialException as exc:
+            self.get_logger().error(f"Serial read error: {exc}")
+
+    def stop_vehicle(self) -> None:
+        if not self.ser.is_open:
+            return
+        message = PCFL.convert_serial_message(0, 0, 0)
+        if not message.endswith("\n"):
+            message += "\n"
+        self.ser.write(message.encode("ascii"))
+
+    def close_serial(self) -> None:
         if self.ser.is_open:
             self.ser.close()
             self.get_logger().info("Serial port closed")
 
 
-def main(args=None):
+def main(args: Optional[list] = None) -> None:
     rclpy.init(args=args)
-
-    node = SerialSenderNode()
-
+    node: Optional[SerialSenderNode] = None
     try:
+        node = SerialSenderNode()
         rclpy.spin(node)
-
     except KeyboardInterrupt:
-        print("\n\nshutdown\n\n")
-        node.stop_vehicle()
-
+        if node is not None:
+            node.stop_vehicle()
     finally:
-        node.close_serial()
+        if node is not None:
+            node.close_serial()
+            node.destroy_node()
+        rclpy.shutdown()
 
-    node.destroy_node()
-    rclpy.shutdown()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
 
 
 
