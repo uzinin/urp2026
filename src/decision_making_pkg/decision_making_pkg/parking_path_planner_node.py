@@ -212,7 +212,7 @@ class ParkingPathPlannerNode(Node):
             return None
 
         # 1. 카메라 맨 아래 중점 (현재 차량 본체의 위치)
-        camera_bottom = np.array([img_width / 2.0, img_height], dtype=np.float32)
+        camera_bottom = np.array([300, 800], dtype=np.float32)
         
         # 2. Left / Right 마커의 중점 (트레일러 후미의 위치)
         trailer_mid = (left + right) / 2.0

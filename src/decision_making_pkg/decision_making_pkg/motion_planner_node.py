@@ -26,8 +26,8 @@ MAX_STEP = 7
 THETA_MAX_DEG = 75.0
 ALPHA = 0.3
 MAX_STEP_DELTA = 1
-MAX_SPEED = 50
-MIN_SPEED = 50
+MAX_SPEED = 150
+MIN_SPEED = 150
 
 
 class MotionPlanningNode(Node):

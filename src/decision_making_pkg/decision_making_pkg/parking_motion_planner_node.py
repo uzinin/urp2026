@@ -30,10 +30,10 @@ ALPHA = 0.3
 MAX_STEP_DELTA = 1
 
 # 🌟 트레일러 픽셀 뷰 후진 전용 제어 게인 및 안전 한계선
-K_LATERAL = 0.5        # 픽셀 오차 각도를 목표 꺾임각으로 변환하는 게인 (실차 튜닝 필요)
+K_LATERAL = 1.5        # 픽셀 오차 각도를 목표 꺾임각으로 변환하는 게인 (실차 튜닝 필요)
 K_HITCH = 0.6          # 꺾임각 오차를 조향 스텝으로 변환하는 게인
-JACKKNIFE_LIMIT = 35.0  # 잭나이프 현상 방지 한계 각도 (도 단위)
-REVERSE_SPEED = -0   # 후진 구동 속도 (하드웨어 모터 스펙에 맞게 부호/크기 설정)
+JACKKNIFE_LIMIT = 30.0  # 잭나이프 현상 방지 한계 각도 (도 단위)
+REVERSE_SPEED =  -30 # 후진 구동 속도 (하드웨어 모터 스펙에 맞게 부호/크기 설정)
 
 
 class MotionPlanningNode(Node):
@@ -97,6 +97,15 @@ class MotionPlanningNode(Node):
         self.current_hitch_angle = msg.data
                 
     def timer_callback(self):
+        if self.path_data is None:
+            return
+           
+        # 🌟 [긴급 진단 출력] 패스의 처음, 중간, 끝점의 생동작 픽셀 값을 찍어봅니다.
+        self.get_logger().info(f"===[DATA CHECK]=== Len: {len(self.path_data)} | "
+                               f"Index 0: {self.path_data[0]} | "
+                               f"Index 15: {self.path_data[min(15, len(self.path_data)-1)]} | "
+                               f"Index Last: {self.path_data[-1]}")
+        
         # 1. 경로 데이터가 아예 없는 경우 (안전을 위해 즉시 정지)
         if self.path_data is None:
             self.steering_command = 0
@@ -117,11 +126,11 @@ class MotionPlanningNode(Node):
                 self.publish_motion_command()
             return
     
-        # 2. 정상 트레일러 동적 패스 추종 및 이중 루프 제어 가동
+        # 2. 정상 트레일러 동적 패스 추종 가동
         else:
             self.cnt_dead = 0
 
-            # 🚨 [비상 안전장치] 잭나이프 한계 도달 시 즉시 정지하여 물리적 파손 방지
+            # [안전장치] 잭나이프 한계 도달 시 즉시 정지
             if abs(self.current_hitch_angle) > JACKKNIFE_LIMIT:
                 self.get_logger().error(f"🚨 JACKKNIFE WARNING! Angle: {self.current_hitch_angle:.1f}°")
                 self.steering_command = 0
@@ -131,56 +140,57 @@ class MotionPlanningNode(Node):
                 return
 
             # ----------------------------------------------------------------------
-            # [외곽 루프 (Outer Loop)] 🌟 이미지 픽셀 매칭형 목표 각도 추출
+            # [외곽 루프 (Outer Loop)] 🌟 유동적 Lookahead로 역조향 타이밍 확보
             # ----------------------------------------------------------------------
-            # 패스의 시작점 (트레일러 본네트 노란 점 픽셀)
             origin_x = self.path_data[0][0]
             origin_y = self.path_data[0][1]
 
-            # 가이드라인 상에서 쫓아갈 앞쪽 목표점 선정 (15번째 픽셀 점 타겟팅)
-            LOOKAHEAD_INDEX = min(15, len(self.path_data) - 1)
+            # 🔥 교정 1: 남은 패스 길이에 비례하여 Lookahead를 유동적으로 결정합니다.
+            # 멀리 있을 땐 끝점(남은 길이의 90%), 가까워지면 코앞을 보게 하여 역조향을 유도합니다.
+            path_len = len(self.path_data)
+            LOOKAHEAD_INDEX = int(path_len * 0.85)
+            LOOKAHEAD_INDEX = max(5, min(path_len - 1, LOOKAHEAD_INDEX)) # 최소 5개 앞은 보되 배열 범위 안으로 제한
+           
             target_point = self.path_data[LOOKAHEAD_INDEX]
-            
-            # 픽셀 좌표 오차 계산
+           
             dx = target_point[0] - origin_x
-            # 픽셀 좌표계는 상단이 0이므로, 전방 진행 방향을 양수(+)로 만들기 위해 부호 반전
             dy = origin_y - target_point[1]  
 
             if abs(dy) > 1e-5:
-                # 🔄 트레일러 후진 역조향 기하학 매핑:
-                # 목표점이 우측(dx > 0)에 있으면 트레일러 뒷무릎을 우측으로 밀기 위해
-                # 목표 꺾임각(gamma_ref)이 음수(-)가 되어 견인차가 왼쪽으로 꺾도록 마이너스(-) 부착
-                target_angle = -math.degrees(math.atan2(dx, dy))
+                pure_angle = math.degrees(math.atan2(dx, dy))
+                # 편차 보상 게인을 0.05에서 0.03으로 살짝 낮춰 오버슈트(과도하게 꺾임)를 방지합니다.
+                target_angle = (pure_angle + (dx * 0.05)) + (self.current_hitch_angle * 0.4)
             else:
                 target_angle = 0.0
 
-            # 미세 픽셀 흔들림 필터링 데드존 (1.5도 미만 컷)
-            if abs(target_angle) < 1.5:
-                target_angle = 0.0
-
-            # 목표 꺾임각(gamma_ref) 산출 및 과도한 접힘 방지 제한 (최대 15도)
-            gamma_ref = K_LATERAL * target_angle
-            gamma_ref = max(-15.0, min(15.0, gamma_ref))
+            # 🔥 교정 2: 대각선 진입 시 너무 깊게 접히는 것을 막기 위해
+            # K_LATERAL은 유지하되, 최대 목표 꺾임각(gamma_ref) 한계를 20도 -> 14도로 줄입니다.
+            # 이렇게 해야 트레일러가 적당히 접히고, 내부 루프가 쉽게 역조향으로 풀 수 있습니다.
+            K_LATERAL_TUNED = 1.5
+            gamma_ref = K_LATERAL_TUNED * target_angle
+            gamma_ref = max(-14.0, min(14.0, gamma_ref))
 
             # ----------------------------------------------------------------------
-            # [내부 루프 (Inner Loop)] 🌟 목표 꺾임각 추종을 위한 포텐쇼미터 피드백 제어
+            # [내부 루프 (Inner Loop)] 🌟 포텐쇼미터 피드백 강화 (명령에 칼같이 반응)
             # ----------------------------------------------------------------------
             hitch_error = gamma_ref - self.current_hitch_angle
-        
-            # 기존 8조 알고리즘의 조향 필터 메커니즘 원본 그대로 계승 (LPF 적용)
+       
+            # LPF (기존 유지)
             self.target_slope_f = (1 - ALPHA) * self.target_slope_f + ALPHA * hitch_error
-            
-            # P 제어 기반 최종 조향 스텝 명령 산출
-            step_f = K_HITCH * self.target_slope_f
+           
+            # 🔥 교정 3: K_HITCH 게인을 0.6 -> 0.85로 상향합니다.
+            # 외곽 루프의 꺾임 명령보다 포텐쇼미터의 '현재 오차를 줄이려는 힘'을 키워서
+            # 제때 핸들을 반대로 쳐서 트레일러를 펴주도록 만듭니다.
+            K_HITCH_TUNED = 0.85
+            step_f = K_HITCH_TUNED * self.target_slope_f
             step = int(round(step_f))
             step = max(-MAX_STEP, min(MAX_STEP, step))
-            
-            # Slew Rate Limiter (갑작스러운 핸들 털림 및 잭나이프 가속 방지)
+           
+            # Slew Rate Limiter (기존 유지)
             step = max(self.prev_step - MAX_STEP_DELTA, min(self.prev_step + MAX_STEP_DELTA, step))
             self.prev_step = step
             self.steering_command = step
 
-            # 속도 결정 (안전 후진 상수 고정)
             self.left_speed_command = REVERSE_SPEED
             self.right_speed_command = REVERSE_SPEED
 
