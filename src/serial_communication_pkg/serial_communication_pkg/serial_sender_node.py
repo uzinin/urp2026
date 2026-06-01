@@ -30,8 +30,8 @@ class SerialSenderNode(Node):
         self.declare_parameter("baud_rate", BAUD_RATE)
 
         # Set these four calibration values after physically measuring A0.
-        self.declare_parameter("articulation_adc_min", 200)
-        self.declare_parameter("articulation_adc_max", 440)
+        self.declare_parameter("articulation_adc_min", 296)
+        self.declare_parameter("articulation_adc_max", 500)
         self.declare_parameter("articulation_angle_min_deg", -40.0)
         self.declare_parameter("articulation_angle_max_deg", 40.0)
 
@@ -89,7 +89,7 @@ class SerialSenderNode(Node):
     def adc_to_angle(self, adc_value: int) -> float:
         adc_limited = max(self.adc_min, min(self.adc_max, adc_value))
         ratio = (adc_limited - self.adc_min) / (self.adc_max - self.adc_min)
-        return self.angle_min_deg + ratio * (self.angle_max_deg - self.angle_min_deg)+8
+        return self.angle_min_deg + ratio * (self.angle_max_deg - self.angle_min_deg)
 
     def publish_articulation(self, line: str) -> None:
         """Parse Arduino telemetry formatted as a<ADC>, for example a512."""
