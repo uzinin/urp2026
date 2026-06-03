@@ -12,6 +12,7 @@ from rclpy.qos import QoSReliabilityPolicy
 import sys
 import cv2
 import os
+import numpy as np  # 채도 설정을 위해 추가되었습니다.
 
 #---------------Variable Setting---------------
 # Publish할 토픽 이름
@@ -22,7 +23,6 @@ DATA_SOURCE = 'camera'
 
 # 카메라(웹캠) 장치 번호 (ls /dev/video* 명령을 터미널 창에 입력하여 확인)
 CAM_NUM = 2
-
 
 # 이미지 데이터가 들어있는 디렉토리의 경로를 입력
 IMAGE_DIRECTORY_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/sample_dataset'
@@ -92,19 +92,53 @@ class ImagePublisherNode(Node):
         self.publisher = self.create_publisher(Image, self.pub_topic, self.qos_profile)
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
         
+    def enhance_red_color(self, frame):
+        """역광 환경에서 빨간색의 채도와 명도를 극대화하는 전처리 함수"""
+        # BGR 공간에서 HSV 공간으로 변환
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+
+        # 전체적으로 채도 히스토그램 평활화(색을 더 진하게) 및 밝기 조정
+        s = cv2.equalizeHist(s)
+        v = cv2.convertScaleAbs(v, alpha=1.3, beta=30)  # alpha: 대비, beta: 밝기 추가 가중치
+
+        # HSV 상에서 빨간색이 갖는 두 영역 대의 마스크 생성
+        lower_red1 = np.array([0, 50, 40])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([165, 50, 40])
+        upper_red2 = np.array([180, 255, 255])
+
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = mask1 + mask2
+
+        # 빨간색으로 인식되는 픽셀만 채도(S)와 명도(V)를 최대에 가깝게 증폭
+        s[red_mask > 0] = cv2.add(s[red_mask > 0], 120)
+        v[red_mask > 0] = cv2.add(v[red_mask > 0], 60)
+
+        # 변환된 채널들을 다시 병합하고 BGR로 복원
+        enhanced_hsv = cv2.merge([h, s, v])
+        return cv2.cvtColor(enhanced_hsv, cv2.COLOR_HSV2BGR)
+
     def timer_callback(self):
         if self.data_source == 'camera':
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.resize(frame, (640, 480))
-                image_msg = self.br.cv2_to_imgmsg(frame)
+                
+                # --- [추가] 빨간색 강화 전처리 수행 ---
+                frame = self.enhance_red_color(frame)
+                
+                image_msg = self.br.cv2_to_imgmsg(frame, encoding="bgr8")
                 image_msg.header = Header()
                 image_msg.header.stamp = self.get_clock().now().to_msg()
                 image_msg.header.frame_id = 'image_frame' 
-                self.publisher.publish(self.br.cv2_to_imgmsg(frame))
+                self.publisher.publish(image_msg) # 기존의 버그성 코드(중복 생성) 수정
+                
                 if self.logger:
-                    cv2.imshow('Camera Image', frame)
+                    cv2.imshow('Camera Image (Enhanced)', frame)
                     cv2.waitKey(1)
+                    
         elif self.data_source == 'image':
             while self.img_num < len(self.img_list):
                 img_file = self.img_list[self.img_num]
@@ -114,32 +148,42 @@ class ImagePublisherNode(Node):
                     self.get_logger().warn('Skipping non-image file: %s' % img_file)
                 else:
                     img = cv2.resize(img, (640, 480))
-                    image_msg = self.br.cv2_to_imgmsg(img)
+                    
+                    # --- [추가] 빨간색 강화 전처리 수행 ---
+                    img = self.enhance_red_color(img)
+                    
+                    image_msg = self.br.cv2_to_imgmsg(img, encoding="bgr8")
                     image_msg.header = Header()
                     image_msg.header.stamp = self.get_clock().now().to_msg()
                     image_msg.header.frame_id = 'image_frame'
-                    self.publisher.publish(self.br.cv2_to_imgmsg(img))
+                    self.publisher.publish(image_msg)
+                    
                     if self.logger:
                         self.get_logger().info('Published image: %s' % img_file)
-                        cv2.imshow('Saved Image', img)
+                        cv2.imshow('Saved Image (Enhanced)', img)
                         cv2.waitKey(1)
                 
                 self.img_num += 1
                 break
             else:
                 self.img_num = 0
+                
         elif self.data_source == 'video':
             ret, img = self.cap.read()
             if ret:
                 img = cv2.resize(img, (640, 480))
-                image_msg = self.br.cv2_to_imgmsg(img)
+                
+                # --- [추가] 빨간색 강화 전처리 수행 ---
+                img = self.enhance_red_color(img)
+                
+                image_msg = self.br.cv2_to_imgmsg(img, encoding="bgr8")
                 image_msg.header = Header()
                 image_msg.header.stamp = self.get_clock().now().to_msg()
                 image_msg.header.frame_id = 'image_frame'
                 self.publisher.publish(image_msg)
-                print(image_msg.header)
+                
                 if self.logger:
-                    cv2.imshow('Video Frame', img)
+                    cv2.imshow('Video Frame (Enhanced)', img)
                     cv2.waitKey(1)
             else:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video to the first frame
@@ -153,8 +197,9 @@ def main(args=None):
         print("\n\nshutdown\n\n")
         pass
     node.destroy_node()
-    if node.cap.isOpened():
-        node.cap.release()
+    if data_source == 'camera' or data_source == 'video': # 에러 방지용 가드
+        if hasattr(node, 'cap') and node.cap.isOpened():
+            node.cap.release()
     cv2.destroyAllWindows()
     rclpy.shutdown()
   

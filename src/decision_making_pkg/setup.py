@@ -27,6 +27,7 @@ setup(
             'parking_path_planner_node = decision_making_pkg.parking_path_planner_node:main',
             'parking_controller_node = decision_making_pkg.parking_controller_node:main',
             'parking_motion_planner_ver2_node = decision_making_pkg.parking_motion_planner_ver2_node:main',
+            'ltb_parking_controller_node = decision_making_pkg.ltb_parking_controller_node:main',
         ],
     },
 )
