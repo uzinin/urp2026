@@ -62,7 +62,8 @@ class ParkingState:
     STATE1_STOP_BEFORE_STATE2 = "STATE1_STOP_BEFORE_STATE2"
     STATE2_COUNTER_TURN = "STATE2_COUNTER_TURN"
     STATE2_NEUTRAL_FORWARD = "STATE2_NEUTRAL_FORWARD"
-    STATE3_NEUTRAL_REVERSE = "STATE3_NEUTRAL_REVERSE"
+    STATE3_1_HITCH_ZERO_FORWARD = "STATE3_1_HITCH_ZERO_FORWARD"
+    STATE3_2_NEUTRAL_REVERSE = "STATE3_2_NEUTRAL_REVERSE"
     STATE4_MISSING_CONFIRM = "STATE4_MISSING_CONFIRM"
     DEBUG_HITCH_STOP = "DEBUG_HITCH_STOP"
     JACKKNIFE_STOP = "JACKKNIFE_STOP"
@@ -155,7 +156,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             self.declare_parameter("parking_orientation_min_aspect_ratio", 1.2).value
         )
         self.hitch_zero_tolerance_deg = float(
-            self.declare_parameter("hitch_zero_tolerance_deg", 2.0).value
+            self.declare_parameter("hitch_zero_tolerance_deg", 11.0).value
         )
         self.neutral_forward_duration_sec = float(
             self.declare_parameter("neutral_forward_duration_sec", 4.0).value
@@ -277,7 +278,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             self.last_alignment_seen_time = now
 
         if self.state in (
-            ParkingState.STATE3_NEUTRAL_REVERSE,
+            ParkingState.STATE3_2_NEUTRAL_REVERSE,
             ParkingState.STATE4_MISSING_CONFIRM,
         ):
             if self.markers_inside_parking(perception):
@@ -313,8 +314,19 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         if self.last_parking_center_x is not None:
             parking_x_error = self.last_parking_center_x - IMG_CX
 
+        state1_map_left_x = 250.0
+        state1_map_right_x = 390.0
+        parking_x_for_target = (
+            IMG_CX if self.last_parking_center_x is None else self.last_parking_center_x
+        )
+        normalized_x = (
+            (parking_x_for_target - state1_map_left_x)
+            / max(state1_map_right_x - state1_map_left_x, 1e-6)
+            * 2.0
+            - 1.0
+        )
         target_hitch_angle = clamp(
-            parking_x_error / IMG_CX * self.state1_hitch_trigger_deg,
+            normalized_x * self.state1_hitch_trigger_deg,
             -self.state1_hitch_trigger_deg,
             self.state1_hitch_trigger_deg,
         )
@@ -326,6 +338,8 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
                 * self.k_parking_x_state1
             )
         )
+        if 0 < abs(target_steering) < 3:
+            target_steering = 3 if target_steering > 0 else -3
 
         self.state = ParkingState.STATE1_INITIAL_TURN
         self.state1_entry_parking_x_error = parking_x_error
@@ -349,7 +363,11 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         return self.current_hitch_angle <= self.state1_target_hitch_angle_deg
 
     def enter_state3(self, reason: str) -> None:
-        self.state = ParkingState.STATE3_NEUTRAL_REVERSE
+        self.state = ParkingState.STATE3_1_HITCH_ZERO_FORWARD
+        self.log(reason)
+
+    def enter_state3_reverse(self, reason: str) -> None:
+        self.state = ParkingState.STATE3_2_NEUTRAL_REVERSE
         self.state3_target_slope_f = 0.0
         self.state3_prev_step = 0
         self.log(reason)
@@ -477,8 +495,8 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
                 return
 
             steering = -self.state1_target_steering
-            if 0 < abs(steering) < 2:
-                steering = 2 if steering > 0 else -2
+            if 0 < abs(steering) < 3:
+                steering = 3 if steering > 0 else -3
             steering = clamp(steering, -self.counter_turn_step, self.counter_turn_step)
             
             self.publish_command(int(steering), self.reverse_speed)
@@ -492,8 +510,15 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
                 self.enter_state1("parking_y <= retry line -> state1")
             return
 
-        # [STATE 3]: 정렬 완료 상태에서 일직선 후진 진입
-        if self.state == ParkingState.STATE3_NEUTRAL_REVERSE:
+        # [STATE 3-1]: state3 진입 후 hitch angle이 0이 될 때까지 중립 전진
+        if self.state == ParkingState.STATE3_1_HITCH_ZERO_FORWARD:
+            self.publish_command(0, self.forward_speed)
+            if self.hitch_is_zero():
+                self.enter_state3_reverse("hitch zero -> state3-2 reverse")
+            return
+
+        # [STATE 3-2]: hitch 정렬 완료 후 기존 후진 조향 로직 수행
+        if self.state == ParkingState.STATE3_2_NEUTRAL_REVERSE:
             steering = self.calculate_state3_ver2_steering()
             self.publish_command(steering, self.reverse_speed)
             if self.parking_currently_missing():
@@ -507,7 +532,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             self.publish_command(0, self.reverse_speed)
             if not self.parking_currently_missing():
                 self.missing_start_time = None
-                self.enter_state3("parking detected again -> state3")
+                self.enter_state3_reverse("parking detected again -> state3-2")
                 return
 
             elapsed = self.parking_missing_elapsed()
@@ -567,28 +592,14 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
 
     # 🌟 [새로 구현]: 사각형 주차 구역과 차량 축의 정렬 상태를 다각도로 평가하는 정밀 완결 검증 함수
     def ready_for_state3_strict(self, heading_error: float) -> bool:
-        if self.last_parking_center_x is None or self.last_marker_midpoint_x is None:
-            return False
-        if self.last_alignment_seen_time is None:
-            return False
-        if time.time() - self.last_alignment_seen_time > self.parking_detection_timeout_sec:
+        if self.last_parking_center_x is None:
             return False
 
-        # 1. 위치 동기화 만족 여부 (주차 타깃 x축과 두 차량 마커의 중점이 이미지 중앙부 영역에 존재해야 함)
+        # 1. 주차 타깃 x축이 이미지 중앙부 영역에 존재해야 함.
         parking_centered = abs(self.last_parking_center_x - IMG_CX) <= self.center_tolerance_px
-        markers_centered = abs(self.last_marker_midpoint_x - IMG_CX) <= self.center_tolerance_px
-        
-        # 2. 각도 축 동기화 만족 여부 (틀어진 헤딩 각도 차이가 오차 허용 범위 이내인가?)
-        axis_aligned = abs(heading_error) <= self.heading_tolerance_deg
-        
-        # 3. 종합 평가판정 (위치 일치 + 🌟각도 평행 일치 + 기존 트레일러 수평 조건 및 굴절 제로화 결합)
-        return (
-            parking_centered
-            and markers_centered
-            and axis_aligned
-            and self.last_parking_is_horizontal
-            and self.hitch_is_zero()
-        )
+
+        # 4. parking 박스가 수평에 가까운지만 함께 확인.
+        return parking_centered and self.last_parking_is_horizontal
 
     def parking_horizontal_alignment(
         self,

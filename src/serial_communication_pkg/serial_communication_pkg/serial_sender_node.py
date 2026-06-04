@@ -16,7 +16,7 @@ PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 
 ARTICULATION_RAW_TOPIC = "/articulation/potentiometer_raw"
-ARTICULATION_ANGLE_TOPIC = "/articulation/angle"
+ARTICULATION_ANGLE_TOPIC = "/articulation/angle1"
 
 
 class SerialSenderNode(Node):
@@ -30,8 +30,8 @@ class SerialSenderNode(Node):
         self.declare_parameter("baud_rate", BAUD_RATE)
 
         # Set these four calibration values after physically measuring A0.
-        self.declare_parameter("articulation_adc_min", 296)
-        self.declare_parameter("articulation_adc_max", 500)
+        self.declare_parameter("articulation_adc_min", 285)
+        self.declare_parameter("articulation_adc_max", 495)
         self.declare_parameter("articulation_angle_min_deg", -40.0)
         self.declare_parameter("articulation_angle_max_deg", 40.0)
 

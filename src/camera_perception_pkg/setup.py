@@ -25,6 +25,7 @@ setup(
             'yolov8_node = camera_perception_pkg.yolov8_node:main',
             'traffic_light_detector_node = camera_perception_pkg.traffic_light_detector_node:main',
             'lane_info_extractor_node = camera_perception_pkg.lane_info_extractor_node:main',
+            'hitch_angle_calculator_node = camera_perception_pkg.hitch_angle_calculator_node:main',
         ],
     },
 )
