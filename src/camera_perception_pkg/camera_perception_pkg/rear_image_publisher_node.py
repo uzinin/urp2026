@@ -40,7 +40,7 @@ class RearImagePublisherNode(Node):
         self.data_source = str(
             self.declare_parameter("data_source", "camera").value
         ).lower()
-        self.cam_num = int(self.declare_parameter("cam_num", 2).value)
+        self.cam_num = int(self.declare_parameter("cam_num", 0).value)
         self.image_directory = str(
             self.declare_parameter("image_directory", "").value
         )

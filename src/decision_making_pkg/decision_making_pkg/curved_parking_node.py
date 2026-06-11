@@ -4,18 +4,7 @@ curved_trailer_parking_motion_planner_node.py
 
 State-machine motion planner for curved reverse parking with an articulated
 trailer vehicle. (Upgraded with variable proportional steering & axis alignment checks)
-
-Inputs:
-  - detections (interfaces_pkg/DetectionArray): YOLO detections for left/right/parking
-  - path_planning_result (interfaces_pkg/PathPlanningResult): parking path points
-  - /articulation/angle (std_msgs/Float32): articulation angle from serial_sender
-
-Output:
-  - topic_control_signal (interfaces_pkg/MotionCommand): steering and motor command
-
-Firmware steering convention follows the existing nodes:
-  steering -7..7, positive is right, negative is left.
-  speed < 0 is reverse.
++ Float32 기반의 가벼운 ArUco 평행 검증 로직 적용 (타임아웃 제거)
 """
 
 import time
@@ -79,123 +68,57 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
     def __init__(self) -> None:
         super().__init__("curved_trailer_parking_motion_planner_node")
 
-        self.sub_detection_topic = self.declare_parameter(
-            "sub_detection_topic", SUB_DETECTION_TOPIC_NAME
-        ).value
-        self.sub_path_topic = self.declare_parameter(
-            "sub_lane_topic", SUB_PATH_TOPIC_NAME
-        ).value
-        self.sub_hitch_topic = self.declare_parameter(
-            "sub_hitch_topic", SUB_HITCH_TOPIC_NAME
-        ).value
+        self.sub_detection_topic = self.declare_parameter("sub_detection_topic", SUB_DETECTION_TOPIC_NAME).value
+        self.sub_path_topic = self.declare_parameter("sub_lane_topic", SUB_PATH_TOPIC_NAME).value
+        self.sub_hitch_topic = self.declare_parameter("sub_hitch_topic", SUB_HITCH_TOPIC_NAME).value
+        # ArUco Yaw 토픽 설정
+        self.sub_aruco_topic = self.declare_parameter("sub_aruco_topic", "aruco_yaw").value
         self.pub_topic = self.declare_parameter("pub_topic", PUB_TOPIC_NAME).value
         self.timer_period = float(self.declare_parameter("timer", TIMER).value)
 
         # ========================= TUNING PARAMETERS =========================
-        self.reverse_speed = int(
-            self.declare_parameter("reverse_speed", REVERSE_SPEED).value
-        )
-        self.forward_speed = int(
-            self.declare_parameter("forward_speed", abs(60)).value
-        )
+        self.reverse_speed = int(self.declare_parameter("reverse_speed", REVERSE_SPEED).value)
+        self.forward_speed = int(self.declare_parameter("forward_speed", abs(60)).value)
 
-        # 조향 가변형 제어 및 정렬을 위한 최대 한계 조향값으로 유지 사용
-        self.initial_turn_step = int(
-            self.declare_parameter("initial_turn_step", MAX_STEP).value
-        )
-        self.counter_turn_step = int(
-            self.declare_parameter("counter_turn_step", 7).value
-        )
+        self.initial_turn_step = int(self.declare_parameter("initial_turn_step", MAX_STEP).value)
+        self.counter_turn_step = int(self.declare_parameter("counter_turn_step", 7).value)
 
-        # state1은 parking 중심 x와 화면 중선의 차이를 조향 스텝으로 변환합니다.
-        self.k_parking_x_state1 = float(
-            self.declare_parameter("k_parking_x_state1", 1.0).value
-        )
-        self.state2_fixed_steering = int(
-            self.declare_parameter("state2_fixed_steering", 7).value
-        )
-        self.state3_k_lateral = float(
-            self.declare_parameter("state3_k_lateral", 0.5).value
-        )
-        self.state3_k_hitch = float(
-            self.declare_parameter("state3_k_hitch", 0.6).value
-        )
+        self.k_parking_x_state1 = float(self.declare_parameter("k_parking_x_state1", 1.0).value)
+        self.state2_fixed_steering = int(self.declare_parameter("state2_fixed_steering", 7).value)
+        self.state3_k_lateral = float(self.declare_parameter("state3_k_lateral", 0.5).value)
+        self.state3_k_hitch = float(self.declare_parameter("state3_k_hitch", 0.6).value)
         self.state3_alpha = float(self.declare_parameter("state3_alpha", 0.3).value)
-        self.state3_gamma_limit_deg = float(
-            self.declare_parameter("state3_gamma_limit_deg", 15.0).value
-        )
-        self.state3_target_angle_deadzone_deg = float(
-            self.declare_parameter("state3_target_angle_deadzone_deg", 1.5).value
-        )
-        self.state3_lookahead_index = int(
-            self.declare_parameter("state3_lookahead_index", 15).value
-        )
-        self.state3_max_step_delta = int(
-            self.declare_parameter("state3_max_step_delta", 1).value
-        )
+        self.state3_gamma_limit_deg = float(self.declare_parameter("state3_gamma_limit_deg", 15.0).value)
+        self.state3_target_angle_deadzone_deg = float(self.declare_parameter("state3_target_angle_deadzone_deg", 1.5).value)
+        self.state3_lookahead_index = int(self.declare_parameter("state3_lookahead_index", 15).value)
+        self.state3_max_step_delta = int(self.declare_parameter("state3_max_step_delta", 1).value)
 
-        # 🌟 [새로 추가] 주차 구역 축과 차량 축의 정렬 허용 오차각 (도 단위)
-        # 이 각도 이내로 진입 각도가 좁혀져야 평행으로 인정합니다.
-        self.heading_tolerance_deg = float(
-            self.declare_parameter("heading_tolerance_deg", 6.0).value
-        )
+        self.heading_tolerance_deg = float(self.declare_parameter("heading_tolerance_deg", 6.0).value)
+        
+        # 🌟 ArUco 마커 평행 오차 허용 각도 (타임아웃 파라미터 삭제됨)
+        self.aruco_parallel_tolerance_deg = float(self.declare_parameter("aruco_parallel_tolerance_deg", 5.0).value)
 
         self.steering_sign = int(self.declare_parameter("steering_sign", 1).value)
         self.max_step_delta = int(self.declare_parameter("max_step_delta", 2).value)
 
-        self.state1_jackknife_margin_deg = float(
-            self.declare_parameter("state1_jackknife_margin_deg", 5.0).value
-        )
-        self.center_tolerance_px = float(
-            self.declare_parameter("center_tolerance_px", 35.0).value
-        )
-        self.parking_horizontal_tolerance_deg = float(
-            self.declare_parameter("parking_horizontal_tolerance_deg", 20.0).value
-        )
-        self.parking_orientation_min_aspect_ratio = float(
-            self.declare_parameter("parking_orientation_min_aspect_ratio", 1.2).value
-        )
-        self.hitch_zero_tolerance_deg = float(
-            self.declare_parameter("hitch_zero_tolerance_deg", 11.0).value
-        )
-        self.neutral_forward_duration_sec = float(
-            self.declare_parameter("neutral_forward_duration_sec", 4.0).value
-        )
-        self.state2_neutral_forward_target_parking_y = float(
-            self.declare_parameter("state2_neutral_forward_target_parking_y", 120.0).value
-        )
-        self.state1_to_state2_stop_duration_sec = float(
-            self.declare_parameter("state1_to_state2_stop_duration_sec", 1.0).value
-        )
-        self.parking_missing_complete_sec = float(
-            self.declare_parameter("parking_missing_complete_sec", 5.0).value
-        )
-        self.parking_detection_timeout_sec = float(
-            self.declare_parameter("parking_detection_timeout_sec", 0.30).value
-        )
-        self.jackknife_limit_deg = float(
-            self.declare_parameter("jackknife_limit_deg", 40.0).value
-        )
-        self.debug_hitch_stop_deg = float(
-            self.declare_parameter("debug_hitch_stop_deg", 60.0).value
-        )
+        self.state1_jackknife_margin_deg = float(self.declare_parameter("state1_jackknife_margin_deg", 5.0).value)
+        self.center_tolerance_px = float(self.declare_parameter("center_tolerance_px", 35.0).value)
+        self.parking_horizontal_tolerance_deg = float(self.declare_parameter("parking_horizontal_tolerance_deg", 20.0).value)
+        self.parking_orientation_min_aspect_ratio = float(self.declare_parameter("parking_orientation_min_aspect_ratio", 1.2).value)
+        self.hitch_zero_tolerance_deg = float(self.declare_parameter("hitch_zero_tolerance_deg", 11.0).value)
+        self.neutral_forward_duration_sec = float(self.declare_parameter("neutral_forward_duration_sec", 4.0).value)
+        self.state2_neutral_forward_target_parking_y = float(self.declare_parameter("state2_neutral_forward_target_parking_y", 120.0).value)
+        self.state1_to_state2_stop_duration_sec = float(self.declare_parameter("state1_to_state2_stop_duration_sec", 1.0).value)
+        self.parking_missing_complete_sec = float(self.declare_parameter("parking_missing_complete_sec", 5.0).value)
+        self.parking_detection_timeout_sec = float(self.declare_parameter("parking_detection_timeout_sec", 0.30).value)
+        self.jackknife_limit_deg = float(self.declare_parameter("jackknife_limit_deg", 40.0).value)
+        self.debug_hitch_stop_deg = float(self.declare_parameter("debug_hitch_stop_deg", 60.0).value)
         self.state1_hitch_trigger_deg = clamp(
-            self.jackknife_limit_deg - self.state1_jackknife_margin_deg,
-            0.0,
-            self.jackknife_limit_deg,
+            self.jackknife_limit_deg - self.state1_jackknife_margin_deg, 0.0, self.jackknife_limit_deg
         )
-        self.jackknife_forward_duration_sec = float(
-            self.declare_parameter("jackknife_forward_duration_sec", 5.0).value
-        )
-        self.jackknife_detection_duration_sec = float(
-            self.declare_parameter("jackknife_detection_duration_sec", 0.2).value
-        )
-        self.jackknife_recovery_target_deg = float(
-            self.declare_parameter(
-                "jackknife_recovery_target_deg",
-                self.state1_hitch_trigger_deg,
-            ).value
-        )
+        self.jackknife_forward_duration_sec = float(self.declare_parameter("jackknife_forward_duration_sec", 5.0).value)
+        self.jackknife_detection_duration_sec = float(self.declare_parameter("jackknife_detection_duration_sec", 0.2).value)
+        self.jackknife_recovery_target_deg = float(self.declare_parameter("jackknife_recovery_target_deg", self.state1_hitch_trigger_deg).value)
         self.minimum_score = float(self.declare_parameter("minimum_score", 0.50).value)
         self.show_log = bool(self.declare_parameter("show_log", True).value)
         # =====================================================================
@@ -207,15 +130,12 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             depth=1,
         )
 
-        self.detection_sub = self.create_subscription(
-            DetectionArray, self.sub_detection_topic, self.detection_callback, qos
-        )
-        self.path_sub = self.create_subscription(
-            PathPlanningResult, self.sub_path_topic, self.path_callback, qos
-        )
-        self.hitch_sub = self.create_subscription(
-            Float32, self.sub_hitch_topic, self.hitch_callback, qos
-        )
+        self.detection_sub = self.create_subscription(DetectionArray, self.sub_detection_topic, self.detection_callback, qos)
+        self.path_sub = self.create_subscription(PathPlanningResult, self.sub_path_topic, self.path_callback, qos)
+        self.hitch_sub = self.create_subscription(Float32, self.sub_hitch_topic, self.hitch_callback, qos)
+        # Float32 타입으로 ArUco 토픽 구독
+        self.aruco_sub = self.create_subscription(Float32, self.sub_aruco_topic, self.aruco_callback, qos)
+        
         self.publisher = self.create_publisher(MotionCommand, self.pub_topic, qos)
 
         self.path_data: Optional[List[Point]] = None
@@ -227,6 +147,9 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         self.last_parking_angle_deg: Optional[float] = None
         self.last_parking_seen_time: Optional[float] = None
         self.current_hitch_angle = 0.0
+        
+        # 최신 ArUco Yaw 각도
+        self.last_aruco_yaw: Optional[float] = None
 
         self.parking_side = 1
         self.state = ParkingState.WAIT_PATH
@@ -240,7 +163,6 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         self.jackknife_forward_start_time: Optional[float] = None
         self.jackknife_over_limit_start_time: Optional[float] = None
 
-        # 🌟 실시간 기하학적 연산을 위한 변수 추가
         self.current_heading_error = 0.0
         self.state1_target_hitch_angle_deg: Optional[float] = None
         self.state1_target_steering = 0
@@ -249,9 +171,11 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         self.state3_prev_step = 0
 
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
-        self.get_logger().info(
-            "curved_trailer_parking_motion_planner_node started with Variable Steering Control"
-        )
+        self.get_logger().info("Curved Planner started with Lightweight ArUco Yaw Control")
+
+    def aruco_callback(self, msg: Float32) -> None:
+        """가볍고 심플하게 Float32 Yaw 각도 수신"""
+        self.last_aruco_yaw = float(msg.data)
 
     def detection_callback(self, msg: DetectionArray) -> None:
         perception = self.extract_perception(msg)
@@ -304,7 +228,6 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
 
     @staticmethod
     def signed_angle_between(vector_a: Point, vector_b: Point) -> float:
-        """두 2차원 벡터 사이의 오차각을 부호 포함 도(Degree) 단위로 계산"""
         cross = vector_a[0] * vector_b[1] - vector_a[1] * vector_b[0]
         dot = vector_a[0] * vector_b[0] + vector_a[1] * vector_b[1]
         return math.degrees(math.atan2(cross, dot))
@@ -386,7 +309,6 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             self.log("waiting for first path")
             return
 
-        # 잭나이프 예외 제어 (기존 원본 구조 계승)
         if self.state == ParkingState.JACKKNIFE_STOP:
             self.publish_command(0, STOP_SPEED)
             if self.jackknife_stop_elapsed() >= self.jackknife_forward_duration_sec:
@@ -430,38 +352,24 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         if self.state == ParkingState.WAIT_PATH:
             self.enter_state1("wait path fallback -> state1")
 
-        # 🌟 [핵심 개선 알고리즘]: 실시간 차량 진행 축과 주차장 축 간의 헤딩 오차각 산출
         if self.path_data is not None and len(self.path_data) >= 3:
-            # 차량 축 벡터: 베지에 곡선 패스의 극초반 시점 방향 활용
             v_veh = (self.path_data[2][0] - self.path_data[0][0], self.path_data[0][1] - self.path_data[2][1])
-            # 주차 목표지점 축 벡터: 베지에 곡선 패스의 종단 주차 공간 방향 활용
             v_park = (self.path_data[-1][0] - self.path_data[-2][0], self.path_data[-2][1] - self.path_data[-1][1])
             
             if math.hypot(*v_veh) > 1e-6 and math.hypot(*v_park) > 1e-6:
                 self.current_heading_error = self.signed_angle_between(v_veh, v_park)
 
-        # ----------------------------------------------------------------------
-        # 상태 기계 분기 처리 (가변 조향 및 엄격한 축 동기화 기반 코드 분기)
-        # ----------------------------------------------------------------------
-
-        # [STATE 1]: 주차 영역 쪽으로 트레일러 뒷머리 꺾어 넣기 (가변 조향)
+        # [STATE 1]
         if self.state == ParkingState.STATE1_INITIAL_TURN:
             if self.state1_target_hitch_angle_deg is None:
                 self.enter_state1("state1 target missing -> recalc once")
 
             if self.ready_for_state3_strict(self.current_heading_error):
-                self.enter_state3("🎯 [축 정렬 일치] 사각형 축 완전 동기화 성공 -> state3")
+                self.enter_state3("🎯 [축 정렬 일치] YOLO 및 ArUco 평행 확인 성공 -> state3")
                 return
 
-            self.log(
-                f"state1 steering calc: target_hitch={self.state1_target_hitch_angle_deg:.1f}°, "
-                f"x_err={self.state1_entry_parking_x_error:.1f}px, "
-                f"steering={self.state1_target_steering}"
-            )
-            
             self.publish_command(self.state1_target_steering, self.reverse_speed)
 
-            # 트레일러가 목표 트리거 각만큼 꺾였다면 카운터 조향 단계로 이전
             if self.state1_target_reached():
                 self.state = ParkingState.STATE1_STOP_BEFORE_STATE2
                 self.state1_to_state2_stop_start_time = time.time()
@@ -471,21 +379,19 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
                 )
             return
 
+        # [STATE 1_STOP]
         if self.state == ParkingState.STATE1_STOP_BEFORE_STATE2:
             self.publish_command(0, STOP_SPEED)
-            if (
-                self.state1_to_state2_stop_elapsed()
-                >= self.state1_to_state2_stop_duration_sec
-            ):
+            if self.state1_to_state2_stop_elapsed() >= self.state1_to_state2_stop_duration_sec:
                 self.state = ParkingState.STATE2_COUNTER_TURN
                 self.state1_to_state2_stop_start_time = None
                 self.log("state1 stop done -> state2")
             return
 
-        # [STATE 2]: 트레일러 역조향을 풀고 일직선 축 정렬 유도 (가변 조향)
+        # [STATE 2]
         if self.state == ParkingState.STATE2_COUNTER_TURN:
             if self.ready_for_state3_strict(self.current_heading_error):
-                self.enter_state3("🎯 [축 정렬 일치] 사각형 축 완전 동기화 성공 -> state3")
+                self.enter_state3("🎯 [축 정렬 일치] YOLO 및 ArUco 평행 확인 성공 -> state3")
                 return
 
             if self.hitch_is_zero():
@@ -502,7 +408,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             self.publish_command(int(steering), self.reverse_speed)
             return
 
-        # [STATE 2_FORWARD]: 기존 원본 탈출/보정 전진 기하 알고리즘 계승
+        # [STATE 2_FORWARD]
         if self.state == ParkingState.STATE2_NEUTRAL_FORWARD:
             self.publish_command(0, self.forward_speed)
             if self.parking_y_reached_state1_retry_line():
@@ -510,14 +416,14 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
                 self.enter_state1("parking_y <= retry line -> state1")
             return
 
-        # [STATE 3-1]: state3 진입 후 hitch angle이 0이 될 때까지 중립 전진
+        # [STATE 3-1]
         if self.state == ParkingState.STATE3_1_HITCH_ZERO_FORWARD:
             self.publish_command(0, self.forward_speed)
             if self.hitch_is_zero():
                 self.enter_state3_reverse("hitch zero -> state3-2 reverse")
             return
 
-        # [STATE 3-2]: hitch 정렬 완료 후 기존 후진 조향 로직 수행
+        # [STATE 3-2]
         if self.state == ParkingState.STATE3_2_NEUTRAL_REVERSE:
             steering = self.calculate_state3_ver2_steering()
             self.publish_command(steering, self.reverse_speed)
@@ -527,7 +433,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
                 self.log("parking disappeared -> state4")
             return
 
-        # [STATE 4]: 사각지대 발생 시 안전 추가 후진 완료 확인 (데드 레코닝 유지)
+        # [STATE 4]
         if self.state == ParkingState.STATE4_MISSING_CONFIRM:
             self.publish_command(0, self.reverse_speed)
             if not self.parking_currently_missing():
@@ -544,10 +450,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             return 0
 
         origin_x, origin_y = self.path_data[0]
-        lookahead_index = min(
-            max(1, self.state3_lookahead_index),
-            len(self.path_data) - 1,
-        )
+        lookahead_index = min(max(1, self.state3_lookahead_index), len(self.path_data) - 1)
         target_x, target_y = self.path_data[lookahead_index]
 
         dx = target_x - origin_x
@@ -561,11 +464,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
             target_angle = 0.0
 
         gamma_ref = self.state3_k_lateral * target_angle
-        gamma_ref = clamp(
-            gamma_ref,
-            -self.state3_gamma_limit_deg,
-            self.state3_gamma_limit_deg,
-        )
+        gamma_ref = clamp(gamma_ref, -self.state3_gamma_limit_deg, self.state3_gamma_limit_deg)
 
         hitch_error = gamma_ref - self.current_hitch_angle
         self.state3_target_slope_f = (
@@ -575,36 +474,30 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
 
         step = int(round(self.state3_k_hitch * self.state3_target_slope_f))
         step = int(clamp(step, -MAX_STEP, MAX_STEP))
-        step = int(
-            clamp(
-                step,
-                self.state3_prev_step - self.state3_max_step_delta,
-                self.state3_prev_step + self.state3_max_step_delta,
-            )
-        )
+        step = int(clamp(step, self.state3_prev_step - self.state3_max_step_delta, self.state3_prev_step + self.state3_max_step_delta))
         self.state3_prev_step = step
         return step
 
-    def parking_is_centered(self) -> bool:
-        if self.last_parking_center_x is None:
-            return False
-        return abs(self.last_parking_center_x - IMG_CX) <= self.center_tolerance_px
-
-    # 🌟 [새로 구현]: 사각형 주차 구역과 차량 축의 정렬 상태를 다각도로 평가하는 정밀 완결 검증 함수
+    # 🌟 [수정됨]: 가장 심플한 형태의 ArUco 평행 검증 (타임아웃 제거)
     def ready_for_state3_strict(self, heading_error: float) -> bool:
         if self.last_parking_center_x is None:
             return False
 
-        # 1. 주차 타깃 x축이 이미지 중앙부 영역에 존재해야 함.
+        # 1. 주차 타깃 x축이 이미지 중앙부 영역에 존재해야 함 (기존 YOLO)
         parking_centered = abs(self.last_parking_center_x - IMG_CX) <= self.center_tolerance_px
 
-        # 4. parking 박스가 수평에 가까운지만 함께 확인.
-        return parking_centered and self.last_parking_is_horizontal
+        # 2. ArUco 마커 기반 차량 평행 검증 (오직 각도만 확인)
+        aruco_parallel = False
+        if self.last_aruco_yaw is not None:
+            yaw = abs(self.last_aruco_yaw)
+            yaw_error = min(yaw, abs(yaw - 180.0))
+            if yaw_error <= self.aruco_parallel_tolerance_deg:
+                aruco_parallel = True
 
-    def parking_horizontal_alignment(
-        self,
-        contour: Optional[List[Point]],
-    ) -> Tuple[bool, Optional[float]]:
+        # 3. 모든 조건 충족 시 True 반환
+        return parking_centered and self.last_parking_is_horizontal and aruco_parallel
+
+    def parking_horizontal_alignment(self, contour: Optional[List[Point]]) -> Tuple[bool, Optional[float]]:
         if contour is None or len(contour) < 3:
             return False, None
 
@@ -673,13 +566,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
 
     def publish_command(self, steering: int, speed: int) -> None:
         target = int(round(clamp(steering * self.steering_sign, -MAX_STEP, MAX_STEP)))
-        target = int(
-            clamp(
-                target,
-                self.last_steering - self.max_step_delta,
-                self.last_steering + self.max_step_delta,
-            )
-        )
+        target = int(clamp(target, self.last_steering - self.max_step_delta, self.last_steering + self.max_step_delta))
         self.last_steering = target
 
         msg = MotionCommand()
@@ -708,11 +595,15 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
         if log_signature == self.last_log_signature:
             return
         self.last_log_signature = log_signature
+        
+        # 로그 출력에 심플한 Yaw 상태 표기 추가
+        aruco_val = f"{self.last_aruco_yaw:.1f}°" if self.last_aruco_yaw is not None else "None"
 
         self.get_logger().info(
             f"[{self.state}] {text}, side={self.parking_side}, "
             f"hitch={self.current_hitch_angle:.1f}, "
             f"err_ang={self.current_heading_error:.1f}°, "
+            f"aruco_yaw={aruco_val}, "
             f"parking_x={self.last_parking_center_x}, "
             f"parking_y={self.last_parking_center_y}"
         )
@@ -752,10 +643,7 @@ class CurvedTrailerParkingMotionPlannerNode(Node):
     def detection_to_contour(detection) -> Optional[List[Point]]:
         if len(detection.mask.data) < 3:
             return None
-        return [
-            (float(point.x), float(point.y))
-            for point in detection.mask.data
-        ]
+        return [(float(point.x), float(point.y)) for point in detection.mask.data]
 
     @staticmethod
     def contour_area(contour: Optional[List[Point]]) -> float:
@@ -821,14 +709,12 @@ def main(args=None) -> None:
 
 if __name__ == "__main__":
     main()
-
-
-#!/usr/bin/env python3
+# #!/usr/bin/env python3
 # """
 # curved_trailer_parking_motion_planner_node.py
 
 # State-machine motion planner for curved reverse parking with an articulated
-# trailer vehicle. (Upgraded with Smart Heading-Distance Joint Variable Trigger Control)
+# trailer vehicle. (Upgraded with variable proportional steering & axis alignment checks)
 
 # Inputs:
 #   - detections (interfaces_pkg/DetectionArray): YOLO detections for left/right/parking
@@ -837,6 +723,10 @@ if __name__ == "__main__":
 
 # Output:
 #   - topic_control_signal (interfaces_pkg/MotionCommand): steering and motor command
+
+# Firmware steering convention follows the existing nodes:
+#   steering -7..7, positive is right, negative is left.
+#   speed < 0 is reverse.
 # """
 
 # import time
@@ -880,10 +770,13 @@ if __name__ == "__main__":
 # class ParkingState:
 #     WAIT_PATH = "WAIT_PATH"
 #     STATE1_INITIAL_TURN = "STATE1_INITIAL_TURN"
+#     STATE1_STOP_BEFORE_STATE2 = "STATE1_STOP_BEFORE_STATE2"
 #     STATE2_COUNTER_TURN = "STATE2_COUNTER_TURN"
 #     STATE2_NEUTRAL_FORWARD = "STATE2_NEUTRAL_FORWARD"
-#     STATE3_NEUTRAL_REVERSE = "STATE3_NEUTRAL_REVERSE"
+#     STATE3_1_HITCH_ZERO_FORWARD = "STATE3_1_HITCH_ZERO_FORWARD"
+#     STATE3_2_NEUTRAL_REVERSE = "STATE3_2_NEUTRAL_REVERSE"
 #     STATE4_MISSING_CONFIRM = "STATE4_MISSING_CONFIRM"
+#     DEBUG_HITCH_STOP = "DEBUG_HITCH_STOP"
 #     JACKKNIFE_STOP = "JACKKNIFE_STOP"
 #     JACKKNIFE_FORWARD_RECOVERY = "JACKKNIFE_FORWARD_RECOVERY"
 #     DONE = "DONE"
@@ -897,50 +790,126 @@ if __name__ == "__main__":
 #     def __init__(self) -> None:
 #         super().__init__("curved_trailer_parking_motion_planner_node")
 
-#         self.sub_detection_topic = self.declare_parameter("sub_detection_topic", SUB_DETECTION_TOPIC_NAME).value
-#         self.sub_path_topic = self.declare_parameter("sub_lane_topic", SUB_PATH_TOPIC_NAME).value
-#         self.sub_hitch_topic = self.declare_parameter("sub_hitch_topic", SUB_HITCH_TOPIC_NAME).value
+#         self.sub_detection_topic = self.declare_parameter(
+#             "sub_detection_topic", SUB_DETECTION_TOPIC_NAME
+#         ).value
+#         self.sub_path_topic = self.declare_parameter(
+#             "sub_lane_topic", SUB_PATH_TOPIC_NAME
+#         ).value
+#         self.sub_hitch_topic = self.declare_parameter(
+#             "sub_hitch_topic", SUB_HITCH_TOPIC_NAME
+#         ).value
 #         self.pub_topic = self.declare_parameter("pub_topic", PUB_TOPIC_NAME).value
 #         self.timer_period = float(self.declare_parameter("timer", TIMER).value)
 
-#         # 제어 파라미터 튜닝
-#         self.reverse_speed = int(self.declare_parameter("reverse_speed", REVERSE_SPEED).value)
-#         self.forward_speed = int(self.declare_parameter("forward_speed", 25).value)
+#         # ========================= TUNING PARAMETERS =========================
+#         self.reverse_speed = int(
+#             self.declare_parameter("reverse_speed", REVERSE_SPEED).value
+#         )
+#         self.forward_speed = int(
+#             self.declare_parameter("forward_speed", abs(60)).value
+#         )
 
-#         self.initial_turn_step = int(self.declare_parameter("initial_turn_step", MAX_STEP).value)
-#         self.counter_turn_step = int(self.declare_parameter("counter_turn_step", 7).value)
+#         # 조향 가변형 제어 및 정렬을 위한 최대 한계 조향값으로 유지 사용
+#         self.initial_turn_step = int(
+#             self.declare_parameter("initial_turn_step", MAX_STEP).value
+#         )
+#         self.counter_turn_step = int(
+#             self.declare_parameter("counter_turn_step", 7).value
+#         )
 
-#         # 가변 조향용 확장 비례 제어 게인값
-#         self.k_angle_state1 = float(self.declare_parameter("k_angle_state1", 140.0).value)
-#         self.k_angle_state2 = float(self.declare_parameter("k_angle_state2", 180.0).value)
+#         # state1은 parking 중심 x와 화면 중선의 차이를 조향 스텝으로 변환합니다.
+#         self.k_parking_x_state1 = float(
+#             self.declare_parameter("k_parking_x_state1", 1.0).value
+#         )
+#         self.state2_fixed_steering = int(
+#             self.declare_parameter("state2_fixed_steering", 7).value
+#         )
+#         self.state3_k_lateral = float(
+#             self.declare_parameter("state3_k_lateral", 0.5).value
+#         )
+#         self.state3_k_hitch = float(
+#             self.declare_parameter("state3_k_hitch", 0.6).value
+#         )
+#         self.state3_alpha = float(self.declare_parameter("state3_alpha", 0.3).value)
+#         self.state3_gamma_limit_deg = float(
+#             self.declare_parameter("state3_gamma_limit_deg", 15.0).value
+#         )
+#         self.state3_target_angle_deadzone_deg = float(
+#             self.declare_parameter("state3_target_angle_deadzone_deg", 1.5).value
+#         )
+#         self.state3_lookahead_index = int(
+#             self.declare_parameter("state3_lookahead_index", 15).value
+#         )
+#         self.state3_max_step_delta = int(
+#             self.declare_parameter("state3_max_step_delta", 1).value
+#         )
 
-#         # 허용 오차 임계 한계선 설정
-#         self.heading_tolerance_deg = float(self.declare_parameter("heading_tolerance_deg", 8.0).value)
-#         self.center_tolerance_px = float(self.declare_parameter("center_tolerance_px", 45.0).value)
-#         self.hitch_zero_tolerance_deg = float(self.declare_parameter("hitch_zero_tolerance_deg", 4.0).value)
+#         # 🌟 [새로 추가] 주차 구역 축과 차량 축의 정렬 허용 오차각 (도 단위)
+#         # 이 각도 이내로 진입 각도가 좁혀져야 평행으로 인정합니다.
+#         self.heading_tolerance_deg = float(
+#             self.declare_parameter("heading_tolerance_deg", 6.0).value
+#         )
 
-#         # 근거리 사선 진입 차단 임계 거리 및 각도
-#         self.emergency_close_dist_px = float(self.declare_parameter("emergency_close_dist_px", 320.0).value)
-#         self.emergency_large_angle_deg = float(self.declare_parameter("emergency_large_angle_deg", 35.0).value)
-
-#         # 잭나이프 안전 복구 기준 한계선
-#         self.jackknife_recovery_target_deg = float(self.declare_parameter("jackknife_recovery_target_deg", 24.0).value)
-
-#         # 조향 방향 전체 반전 (-1)
-#         self.steering_sign = int(self.declare_parameter("steering_sign", -1).value)
+#         self.steering_sign = int(self.declare_parameter("steering_sign", 1).value)
 #         self.max_step_delta = int(self.declare_parameter("max_step_delta", 2).value)
 
-#         self.parking_horizontal_tolerance_deg = float(self.declare_parameter("parking_horizontal_tolerance_deg", 20.0).value)
-#         self.parking_orientation_min_aspect_ratio = float(self.declare_parameter("parking_orientation_min_aspect_ratio", 1.2).value)
-#         self.path_straight_tolerance_px = float(self.declare_parameter("path_straight_tolerance_px", 30.0).value)
-#         self.path_timeout_sec = float(self.declare_parameter("path_timeout_sec", 0.5).value)
-#         self.parking_missing_complete_sec = float(self.declare_parameter("parking_missing_complete_sec", 2.0).value)
-#         self.parking_detection_timeout_sec = float(self.declare_parameter("parking_detection_timeout_sec", 0.30).value)
-#         self.jackknife_limit_deg = float(self.declare_parameter("jackknife_limit_deg", 40.0).value)
-#         self.jackknife_stop_duration_sec = float(self.declare_parameter("jackknife_stop_duration_sec", 1.0).value)
-#         self.jackknife_detection_duration_sec = float(self.declare_parameter("jackknife_detection_duration_sec", 0.2).value)
+#         self.state1_jackknife_margin_deg = float(
+#             self.declare_parameter("state1_jackknife_margin_deg", 5.0).value
+#         )
+#         self.center_tolerance_px = float(
+#             self.declare_parameter("center_tolerance_px", 35.0).value
+#         )
+#         self.parking_horizontal_tolerance_deg = float(
+#             self.declare_parameter("parking_horizontal_tolerance_deg", 20.0).value
+#         )
+#         self.parking_orientation_min_aspect_ratio = float(
+#             self.declare_parameter("parking_orientation_min_aspect_ratio", 1.2).value
+#         )
+#         self.hitch_zero_tolerance_deg = float(
+#             self.declare_parameter("hitch_zero_tolerance_deg", 11.0).value
+#         )
+#         self.neutral_forward_duration_sec = float(
+#             self.declare_parameter("neutral_forward_duration_sec", 4.0).value
+#         )
+#         self.state2_neutral_forward_target_parking_y = float(
+#             self.declare_parameter("state2_neutral_forward_target_parking_y", 120.0).value
+#         )
+#         self.state1_to_state2_stop_duration_sec = float(
+#             self.declare_parameter("state1_to_state2_stop_duration_sec", 1.0).value
+#         )
+#         self.parking_missing_complete_sec = float(
+#             self.declare_parameter("parking_missing_complete_sec", 5.0).value
+#         )
+#         self.parking_detection_timeout_sec = float(
+#             self.declare_parameter("parking_detection_timeout_sec", 0.30).value
+#         )
+#         self.jackknife_limit_deg = float(
+#             self.declare_parameter("jackknife_limit_deg", 40.0).value
+#         )
+#         self.debug_hitch_stop_deg = float(
+#             self.declare_parameter("debug_hitch_stop_deg", 60.0).value
+#         )
+#         self.state1_hitch_trigger_deg = clamp(
+#             self.jackknife_limit_deg - self.state1_jackknife_margin_deg,
+#             0.0,
+#             self.jackknife_limit_deg,
+#         )
+#         self.jackknife_forward_duration_sec = float(
+#             self.declare_parameter("jackknife_forward_duration_sec", 5.0).value
+#         )
+#         self.jackknife_detection_duration_sec = float(
+#             self.declare_parameter("jackknife_detection_duration_sec", 0.2).value
+#         )
+#         self.jackknife_recovery_target_deg = float(
+#             self.declare_parameter(
+#                 "jackknife_recovery_target_deg",
+#                 self.state1_hitch_trigger_deg,
+#             ).value
+#         )
 #         self.minimum_score = float(self.declare_parameter("minimum_score", 0.50).value)
 #         self.show_log = bool(self.declare_parameter("show_log", True).value)
+#         # =====================================================================
 
 #         qos = QoSProfile(
 #             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -949,15 +918,20 @@ if __name__ == "__main__":
 #             depth=1,
 #         )
 
-#         self.detection_sub = self.create_subscription(DetectionArray, self.sub_detection_topic, self.detection_callback, qos)
-#         self.path_sub = self.create_subscription(PathPlanningResult, self.sub_path_topic, self.path_callback, qos)
-#         self.hitch_sub = self.create_subscription(Float32, self.sub_hitch_topic, self.hitch_callback, qos)
+#         self.detection_sub = self.create_subscription(
+#             DetectionArray, self.sub_detection_topic, self.detection_callback, qos
+#         )
+#         self.path_sub = self.create_subscription(
+#             PathPlanningResult, self.sub_path_topic, self.path_callback, qos
+#         )
+#         self.hitch_sub = self.create_subscription(
+#             Float32, self.sub_hitch_topic, self.hitch_callback, qos
+#         )
 #         self.publisher = self.create_publisher(MotionCommand, self.pub_topic, qos)
 
 #         self.path_data: Optional[List[Point]] = None
-#         self.last_path_seen_time: Optional[float] = None
-#         self.last_path_max_deviation_px: Optional[float] = None
 #         self.last_parking_center_x: Optional[float] = None
+#         self.last_parking_center_y: Optional[float] = None
 #         self.last_marker_midpoint_x: Optional[float] = None
 #         self.last_alignment_seen_time: Optional[float] = None
 #         self.last_parking_is_horizontal = False
@@ -968,50 +942,69 @@ if __name__ == "__main__":
 #         self.parking_side = 1
 #         self.state = ParkingState.WAIT_PATH
 #         self.last_steering = 0
+#         self.last_command_signature: Optional[Tuple[int, int]] = None
+#         self.last_log_signature: Optional[Tuple[str, str]] = None
 #         self.missing_start_time: Optional[float] = None
-        
-#         # 🌟 [새로 추가] 전진 보정 상태 전용 독립 타임스탬프 변수
-#         self.forward_start_time: Optional[float] = None
-        
+#         self.neutral_forward_start_time: Optional[float] = None
+#         self.state1_to_state2_stop_start_time: Optional[float] = None
 #         self.jackknife_stop_start_time: Optional[float] = None
+#         self.jackknife_forward_start_time: Optional[float] = None
 #         self.jackknife_over_limit_start_time: Optional[float] = None
 
+#         # 🌟 실시간 기하학적 연산을 위한 변수 추가
 #         self.current_heading_error = 0.0
+#         self.state1_target_hitch_angle_deg: Optional[float] = None
+#         self.state1_target_steering = 0
+#         self.state1_entry_parking_x_error = 0.0
+#         self.state3_target_slope_f = 0.0
+#         self.state3_prev_step = 0
+
 #         self.timer = self.create_timer(self.timer_period, self.timer_callback)
-#         self.get_logger().info("curved_trailer_parking_motion_planner_node initialized.")
+#         self.get_logger().info(
+#             "curved_trailer_parking_motion_planner_node started with Variable Steering Control"
+#         )
 
 #     def detection_callback(self, msg: DetectionArray) -> None:
 #         perception = self.extract_perception(msg)
 #         now = time.time()
+
 #         parking = perception.get(CLS_PARKING)
 #         if parking is not None:
 #             self.last_parking_center_x = parking["center_x"]
+#             self.last_parking_center_y = parking["center_y"]
 #             self.last_parking_seen_time = now
 #             self.missing_start_time = None
 #             self.parking_side = self.side_from_x(parking["center_x"])
-#             self.last_parking_is_horizontal, self.last_parking_angle_deg = self.parking_horizontal_alignment(parking.get("contour"))
+#             (
+#                 self.last_parking_is_horizontal,
+#                 self.last_parking_angle_deg,
+#             ) = self.parking_horizontal_alignment(parking.get("contour"))
 
 #         left = perception.get(CLS_LEFT)
 #         right = perception.get(CLS_RIGHT)
 #         if parking is not None and left is not None and right is not None:
-#             self.last_marker_midpoint_x = (float(left["center_x"]) + float(right["center_x"])) / 2.0
+#             self.last_marker_midpoint_x = (
+#                 float(left["center_x"]) + float(right["center_x"])
+#             ) / 2.0
 #             self.last_alignment_seen_time = now
 
-#         if self.state in (ParkingState.STATE3_NEUTRAL_REVERSE, ParkingState.STATE4_MISSING_CONFIRM):
+#         if self.state in (
+#             ParkingState.STATE3_2_NEUTRAL_REVERSE,
+#             ParkingState.STATE4_MISSING_CONFIRM,
+#         ):
 #             if self.markers_inside_parking(perception):
 #                 self.complete("left/right marker centers reached parking boundary")
 
 #     def path_callback(self, msg: PathPlanningResult) -> None:
 #         if len(msg.x_points) != len(msg.y_points) or len(msg.x_points) < 2:
 #             return
+
 #         self.path_data = list(zip(msg.x_points, msg.y_points))
-#         self.last_path_seen_time = time.time()
-#         self.last_path_max_deviation_px = self.path_max_deviation_px(self.path_data)
 #         if self.last_parking_center_x is None:
 #             self.parking_side = self.side_from_path(self.path_data)
+
 #         if self.state == ParkingState.WAIT_PATH:
-#             self.state = ParkingState.STATE1_INITIAL_TURN
-#             self.log("path received -> state1")
+#             self.enter_state1("path received -> state1")
 
 #     def hitch_callback(self, msg: Float32) -> None:
 #         self.current_hitch_angle = float(msg.data)
@@ -1022,31 +1015,111 @@ if __name__ == "__main__":
 
 #     @staticmethod
 #     def signed_angle_between(vector_a: Point, vector_b: Point) -> float:
+#         """두 2차원 벡터 사이의 오차각을 부호 포함 도(Degree) 단위로 계산"""
 #         cross = vector_a[0] * vector_b[1] - vector_a[1] * vector_b[0]
 #         dot = vector_a[0] * vector_b[0] + vector_a[1] * vector_b[1]
 #         return math.degrees(math.atan2(cross, dot))
+
+#     def enter_state1(self, reason: str) -> None:
+#         parking_x_error = 0.0
+#         if self.last_parking_center_x is not None:
+#             parking_x_error = self.last_parking_center_x - IMG_CX
+
+#         state1_map_left_x = 250.0
+#         state1_map_right_x = 390.0
+#         parking_x_for_target = (
+#             IMG_CX if self.last_parking_center_x is None else self.last_parking_center_x
+#         )
+#         normalized_x = (
+#             (parking_x_for_target - state1_map_left_x)
+#             / max(state1_map_right_x - state1_map_left_x, 1e-6)
+#             * 2.0
+#             - 1.0
+#         )
+#         target_hitch_angle = clamp(
+#             normalized_x * self.state1_hitch_trigger_deg,
+#             -self.state1_hitch_trigger_deg,
+#             self.state1_hitch_trigger_deg,
+#         )
+#         target_steering = int(
+#             round(
+#                 target_hitch_angle
+#                 / max(self.state1_hitch_trigger_deg, 1e-6)
+#                 * self.initial_turn_step
+#                 * self.k_parking_x_state1
+#             )
+#         )
+#         if 0 < abs(target_steering) < 3:
+#             target_steering = 3 if target_steering > 0 else -3
+
+#         self.state = ParkingState.STATE1_INITIAL_TURN
+#         self.state1_entry_parking_x_error = parking_x_error
+#         self.state1_target_hitch_angle_deg = target_hitch_angle
+#         self.state1_target_steering = int(
+#             clamp(target_steering, -self.initial_turn_step, self.initial_turn_step)
+#         )
+#         self.log(
+#             f"{reason}: state1 target hitch={self.state1_target_hitch_angle_deg:.1f}°, "
+#             f"x_err={self.state1_entry_parking_x_error:.1f}px, "
+#             f"steering={self.state1_target_steering}"
+#         )
+
+#     def state1_target_reached(self) -> bool:
+#         if self.state1_target_hitch_angle_deg is None:
+#             return False
+#         if abs(self.state1_target_hitch_angle_deg) <= self.hitch_zero_tolerance_deg:
+#             return True
+#         if self.state1_target_hitch_angle_deg > 0.0:
+#             return self.current_hitch_angle >= self.state1_target_hitch_angle_deg
+#         return self.current_hitch_angle <= self.state1_target_hitch_angle_deg
+
+#     def enter_state3(self, reason: str) -> None:
+#         self.state = ParkingState.STATE3_1_HITCH_ZERO_FORWARD
+#         self.log(reason)
+
+#     def enter_state3_reverse(self, reason: str) -> None:
+#         self.state = ParkingState.STATE3_2_NEUTRAL_REVERSE
+#         self.state3_target_slope_f = 0.0
+#         self.state3_prev_step = 0
+#         self.log(reason)
 
 #     def timer_callback(self) -> None:
 #         if self.state == ParkingState.DONE:
 #             self.publish_command(0, STOP_SPEED)
 #             return
 
-#         if self.path_data is None and self.state == ParkingState.WAIT_PATH:
+#         if self.state == ParkingState.DEBUG_HITCH_STOP:
 #             self.publish_command(0, STOP_SPEED)
 #             return
 
-#         # 잭나이프 예외 안전 제어 루틴
+#         if self.path_data is None and self.state == ParkingState.WAIT_PATH:
+#             self.publish_command(0, STOP_SPEED)
+#             self.log("waiting for first path")
+#             return
+
+#         # 잭나이프 예외 제어 (기존 원본 구조 계승)
 #         if self.state == ParkingState.JACKKNIFE_STOP:
 #             self.publish_command(0, STOP_SPEED)
-#             if self.jackknife_stop_elapsed() >= self.jackknife_stop_duration_sec:
+#             if self.jackknife_stop_elapsed() >= self.jackknife_forward_duration_sec:
 #                 self.state = ParkingState.JACKKNIFE_FORWARD_RECOVERY
 #                 self.jackknife_stop_start_time = None
+#                 self.log("jackknife stop done -> forward recovery")
 #             return
 
 #         if self.state == ParkingState.JACKKNIFE_FORWARD_RECOVERY:
 #             self.publish_command(0, self.forward_speed)
-#             if self.hitch_ready_for_state2():
-#                 self.state = ParkingState.STATE2_COUNTER_TURN
+#             if self.jackknife_forward_elapsed() >= self.jackknife_forward_duration_sec:
+#                 self.jackknife_forward_start_time = None
+#                 self.enter_state1("jackknife forward 5s done -> state1")
+#             return
+
+#         if abs(self.current_hitch_angle) >= self.debug_hitch_stop_deg:
+#             self.state = ParkingState.DEBUG_HITCH_STOP
+#             self.publish_command(0, STOP_SPEED)
+#             self.log(
+#                 f"debug hitch stop: hitch={self.current_hitch_angle:.1f}, "
+#                 f"limit={self.debug_hitch_stop_deg:.1f}"
+#             )
 #             return
 
 #         if abs(self.current_hitch_angle) >= self.jackknife_limit_deg:
@@ -1054,150 +1127,214 @@ if __name__ == "__main__":
 #             if self.jackknife_over_limit_start_time is None:
 #                 self.jackknife_over_limit_start_time = now
 #             if now - self.jackknife_over_limit_start_time >= self.jackknife_detection_duration_sec:
-#                 self.state = ParkingState.JACKKNIFE_STOP
-#                 self.jackknife_stop_start_time = now
+#                 self.state = ParkingState.JACKKNIFE_FORWARD_RECOVERY
+#                 self.jackknife_forward_start_time = now
 #                 self.jackknife_over_limit_start_time = None
-#                 self.publish_command(0, STOP_SPEED)
+#                 self.publish_command(0, self.forward_speed)
+#                 self.log(
+#                     f"jackknife limit -> forward 5s: hitch={self.current_hitch_angle:.1f}"
+#                 )
 #                 return
 #             return
 #         self.jackknife_over_limit_start_time = None
 
-#         # 기하학 오차 벡터 연산 부
-#         heading_error = 0.0
-#         remaining_distance = 500.0
+#         if self.state == ParkingState.WAIT_PATH:
+#             self.enter_state1("wait path fallback -> state1")
 
+#         # 🌟 [핵심 개선 알고리즘]: 실시간 차량 진행 축과 주차장 축 간의 헤딩 오차각 산출
 #         if self.path_data is not None and len(self.path_data) >= 3:
+#             # 차량 축 벡터: 베지에 곡선 패스의 극초반 시점 방향 활용
 #             v_veh = (self.path_data[2][0] - self.path_data[0][0], self.path_data[0][1] - self.path_data[2][1])
+#             # 주차 목표지점 축 벡터: 베지에 곡선 패스의 종단 주차 공간 방향 활용
 #             v_park = (self.path_data[-1][0] - self.path_data[-2][0], self.path_data[-2][1] - self.path_data[-1][1])
+            
 #             if math.hypot(*v_veh) > 1e-6 and math.hypot(*v_park) > 1e-6:
-#                 heading_error = self.signed_angle_between(v_veh, v_park)
-#                 self.current_heading_error = heading_error
-#             remaining_distance = self.distance(self.path_data[0], self.path_data[-1])
-
-#         distance_denominator = max(40.0, remaining_distance)
-
-#         # 거리와 '축 오차 각도'를 결합하고, 원거리 감도를 최적화(0.015)한 가변 트리거 식
-#         error_factor = clamp(abs(heading_error) / 45.0, 0.0, 1.0)
-#         dynamic_trigger_deg = clamp(5.0 + (remaining_distance * 0.015 * error_factor), 5.0, 18.0)
-
-#         # 긴급 전진 탈출 가로채기
-#         if self.state in (ParkingState.STATE1_INITIAL_TURN, ParkingState.STATE2_COUNTER_TURN):
-#             if remaining_distance <= self.emergency_close_dist_px and abs(heading_error) >= self.emergency_large_angle_deg:
-#                 self.state = ParkingState.STATE2_NEUTRAL_FORWARD
-#                 self.forward_start_time = time.time()  # 🌟 전진 보정 타이머 트리거 선언
-#                 self.get_logger().warn(f"🚨 [EMERGENCY ESCAPE] 주차 불가 돌입! Dist: {remaining_distance:.1f}px, Ang: {heading_error:.1f}° -> 전진 보정!")
-#                 return
+#                 self.current_heading_error = self.signed_angle_between(v_veh, v_park)
 
 #         # ----------------------------------------------------------------------
-#         # 상태 기계 분기 처리 영역
+#         # 상태 기계 분기 처리 (가변 조향 및 엄격한 축 동기화 기반 코드 분기)
 #         # ----------------------------------------------------------------------
 
-#         # [STATE 1]: 초기 진입 단계
+#         # [STATE 1]: 주차 영역 쪽으로 트레일러 뒷머리 꺾어 넣기 (가변 조향)
 #         if self.state == ParkingState.STATE1_INITIAL_TURN:
-#             if self.ready_for_state3_strict(heading_error):
-#                 self.state = ParkingState.STATE3_NEUTRAL_REVERSE
-#                 self.log("🎯 [정렬 순항] 축과 중심선 일치 확인 -> STATE3로 직행 안착")
+#             if self.state1_target_hitch_angle_deg is None:
+#                 self.enter_state1("state1 target missing -> recalc once")
+
+#             if self.ready_for_state3_strict(self.current_heading_error):
+#                 self.enter_state3("🎯 [축 정렬 일치] 사각형 축 완전 동기화 성공 -> state3")
 #                 return
 
-#             calculated_steering = int(round((heading_error / distance_denominator) * self.k_angle_state1))
-#             steering = clamp(calculated_steering, -self.initial_turn_step, self.initial_turn_step)
-#             self.publish_command(int(steering), self.reverse_speed)
+#             self.log(
+#                 f"state1 steering calc: target_hitch={self.state1_target_hitch_angle_deg:.1f}°, "
+#                 f"x_err={self.state1_entry_parking_x_error:.1f}px, "
+#                 f"steering={self.state1_target_steering}"
+#             )
+            
+#             self.publish_command(self.state1_target_steering, self.reverse_speed)
 
-#             if abs(self.current_hitch_angle) >= dynamic_trigger_deg:
-#                 self.state = ParkingState.STATE2_COUNTER_TURN
-#                 self.log(f"hitch trigger -> state2: dist={remaining_distance:.1f}px, trigger={dynamic_trigger_deg:.1f}°, error={heading_error:.1f}°")
+#             # 트레일러가 목표 트리거 각만큼 꺾였다면 카운터 조향 단계로 이전
+#             if self.state1_target_reached():
+#                 self.state = ParkingState.STATE1_STOP_BEFORE_STATE2
+#                 self.state1_to_state2_stop_start_time = time.time()
+#                 self.log(
+#                     f"hitch target reached -> stop before state2: "
+#                     f"target={self.state1_target_hitch_angle_deg:.1f}°"
+#                 )
 #             return
 
-#         # [STATE 2]: 카운터 조향 및 축 평행 정렬 단계
+#         if self.state == ParkingState.STATE1_STOP_BEFORE_STATE2:
+#             self.publish_command(0, STOP_SPEED)
+#             if (
+#                 self.state1_to_state2_stop_elapsed()
+#                 >= self.state1_to_state2_stop_duration_sec
+#             ):
+#                 self.state = ParkingState.STATE2_COUNTER_TURN
+#                 self.state1_to_state2_stop_start_time = None
+#                 self.log("state1 stop done -> state2")
+#             return
+
+#         # [STATE 2]: 트레일러 역조향을 풀고 일직선 축 정렬 유도 (가변 조향)
 #         if self.state == ParkingState.STATE2_COUNTER_TURN:
-#             if self.ready_for_state3_strict(heading_error):
-#                 self.state = ParkingState.STATE3_NEUTRAL_REVERSE
-#                 self.log("🎯 [축 정렬 동기화] 직사각형 축 평행 일치 완료 -> state3")
+#             if self.ready_for_state3_strict(self.current_heading_error):
+#                 self.enter_state3("🎯 [축 정렬 일치] 사각형 축 완전 동기화 성공 -> state3")
 #                 return
 
 #             if self.hitch_is_zero():
 #                 self.state = ParkingState.STATE2_NEUTRAL_FORWARD
-#                 self.forward_start_time = time.time()  # 🌟 전진 보정 타이머 트리거 선언
-#                 self.log("hitch zero -> neutral forward (Timer Started)")
+#                 self.neutral_forward_start_time = time.time()
+#                 self.log("hitch zero -> neutral forward before retrying state1")
 #                 return
 
-#             calculated_steering = int(round((-heading_error / distance_denominator) * self.k_angle_state2))
-#             steering = clamp(calculated_steering, -self.counter_turn_step, self.counter_turn_step)
+#             steering = -self.state1_target_steering
+#             if 0 < abs(steering) < 3:
+#                 steering = 3 if steering > 0 else -3
+#             steering = clamp(steering, -self.counter_turn_step, self.counter_turn_step)
+            
 #             self.publish_command(int(steering), self.reverse_speed)
 #             return
 
-#         # 🌟 [완벽 수정] [STATE 2_FORWARD]: 타 노드 변수 간섭 차단 전용 타이머 제어
+#         # [STATE 2_FORWARD]: 기존 원본 탈출/보정 전진 기하 알고리즘 계승
 #         if self.state == ParkingState.STATE2_NEUTRAL_FORWARD:
-            
-#             # 카메라 콜백에서 리셋되지 않는 독립 변수 사용
-#             if self.forward_start_time is None:
-#                 self.forward_start_time = time.time()
-            
-#             forward_elapsed = time.time() - self.forward_start_time
-
-#             # 1.5초 타이머가 정확히 누적 측정됩니다.
-#             if forward_elapsed >= 2.0:
-#                 self.state = ParkingState.STATE1_INITIAL_TURN
-#                 self.forward_start_time = None  # 타이머 리셋
-#                 self.log(f"🎯 [구출 전진 종료] 1.5초 타임아웃 완료 -> STATE1 후진 재진입")
-#                 return
-            
 #             self.publish_command(0, self.forward_speed)
+#             if self.parking_y_reached_state1_retry_line():
+#                 self.neutral_forward_start_time = None
+#                 self.enter_state1("parking_y <= retry line -> state1")
 #             return
 
-#         # [STATE 3]: 직선 후진 안착 단계
-#         if self.state == ParkingState.STATE3_NEUTRAL_REVERSE:
-#             self.publish_command(0, self.reverse_speed)
+#         # [STATE 3-1]: state3 진입 후 hitch angle이 0이 될 때까지 중립 전진
+#         if self.state == ParkingState.STATE3_1_HITCH_ZERO_FORWARD:
+#             self.publish_command(0, self.forward_speed)
+#             if self.hitch_is_zero():
+#                 self.enter_state3_reverse("hitch zero -> state3-2 reverse")
+#             return
+
+#         # [STATE 3-2]: hitch 정렬 완료 후 기존 후진 조향 로직 수행
+#         if self.state == ParkingState.STATE3_2_NEUTRAL_REVERSE:
+#             steering = self.calculate_state3_ver2_steering()
+#             self.publish_command(steering, self.reverse_speed)
 #             if self.parking_currently_missing():
 #                 self.state = ParkingState.STATE4_MISSING_CONFIRM
 #                 self.missing_start_time = time.time()
 #                 self.log("parking disappeared -> state4")
 #             return
 
-#         # [STATE 4]: 카메라 사각지대 관성 타이머 후진 단계
+#         # [STATE 4]: 사각지대 발생 시 안전 추가 후진 완료 확인 (데드 레코닝 유지)
 #         if self.state == ParkingState.STATE4_MISSING_CONFIRM:
 #             self.publish_command(0, self.reverse_speed)
 #             if not self.parking_currently_missing():
-#                 self.state = ParkingState.STATE3_NEUTRAL_REVERSE
 #                 self.missing_start_time = None
-#                 self.log("parking detected again -> state3")
+#                 self.enter_state3_reverse("parking detected again -> state3-2")
 #                 return
+
 #             elapsed = self.parking_missing_elapsed()
 #             if elapsed >= self.parking_missing_complete_sec:
 #                 self.complete(f"parking disappeared for {elapsed:.1f}s")
+
+#     def calculate_state3_ver2_steering(self) -> int:
+#         if self.path_data is None or len(self.path_data) < 2:
+#             return 0
+
+#         origin_x, origin_y = self.path_data[0]
+#         lookahead_index = min(
+#             max(1, self.state3_lookahead_index),
+#             len(self.path_data) - 1,
+#         )
+#         target_x, target_y = self.path_data[lookahead_index]
+
+#         dx = target_x - origin_x
+#         dy = origin_y - target_y
+#         if abs(dy) > 1e-5:
+#             target_angle = -math.degrees(math.atan2(dx, dy))
+#         else:
+#             target_angle = 0.0
+
+#         if abs(target_angle) < self.state3_target_angle_deadzone_deg:
+#             target_angle = 0.0
+
+#         gamma_ref = self.state3_k_lateral * target_angle
+#         gamma_ref = clamp(
+#             gamma_ref,
+#             -self.state3_gamma_limit_deg,
+#             self.state3_gamma_limit_deg,
+#         )
+
+#         hitch_error = gamma_ref - self.current_hitch_angle
+#         self.state3_target_slope_f = (
+#             (1.0 - self.state3_alpha) * self.state3_target_slope_f
+#             + self.state3_alpha * hitch_error
+#         )
+
+#         step = int(round(self.state3_k_hitch * self.state3_target_slope_f))
+#         step = int(clamp(step, -MAX_STEP, MAX_STEP))
+#         step = int(
+#             clamp(
+#                 step,
+#                 self.state3_prev_step - self.state3_max_step_delta,
+#                 self.state3_prev_step + self.state3_max_step_delta,
+#             )
+#         )
+#         self.state3_prev_step = step
+#         return step
 
 #     def parking_is_centered(self) -> bool:
 #         if self.last_parking_center_x is None:
 #             return False
 #         return abs(self.last_parking_center_x - IMG_CX) <= self.center_tolerance_px
 
+#     # 🌟 [새로 구현]: 사각형 주차 구역과 차량 축의 정렬 상태를 다각도로 평가하는 정밀 완결 검증 함수
 #     def ready_for_state3_strict(self, heading_error: float) -> bool:
-#         if self.last_parking_center_x is None or self.last_marker_midpoint_x is None:
+#         if self.last_parking_center_x is None:
 #             return False
-#         if self.last_alignment_seen_time is None:
-#             return False
-#         if time.time() - self.last_alignment_seen_time > self.parking_detection_timeout_sec:
-#             return False
-#         markers_centered = abs(self.last_marker_midpoint_x - IMG_CX) <= self.center_tolerance_px
-#         axis_aligned = abs(heading_error) <= self.heading_tolerance_deg
-#         return markers_centered and axis_aligned and self.hitch_is_zero()
 
-#     def parking_horizontal_alignment(self, contour: Optional[List[Point]]) -> Tuple[bool, Optional[float]]:
+#         # 1. 주차 타깃 x축이 이미지 중앙부 영역에 존재해야 함.
+#         parking_centered = abs(self.last_parking_center_x - IMG_CX) <= self.center_tolerance_px
+
+#         # 4. parking 박스가 수평에 가까운지만 함께 확인.
+#         return parking_centered and self.last_parking_is_horizontal
+
+#     def parking_horizontal_alignment(
+#         self,
+#         contour: Optional[List[Point]],
+#     ) -> Tuple[bool, Optional[float]]:
 #         if contour is None or len(contour) < 3:
 #             return False, None
+
 #         points = np.array(contour, dtype=np.float32)
 #         centered = points - np.mean(points, axis=0)
 #         covariance = centered.T @ centered / max(1, len(points))
 #         eigvals, eigvecs = np.linalg.eigh(covariance)
+
 #         long_index = int(np.argmax(eigvals))
 #         short_index = 1 - long_index
 #         long_var = float(eigvals[long_index])
 #         short_var = float(eigvals[short_index])
 #         if short_var <= 1e-6:
 #             return False, None
+
 #         aspect_ratio = float(np.sqrt(long_var / short_var))
 #         if aspect_ratio < self.parking_orientation_min_aspect_ratio:
 #             return False, None
+
 #         long_axis = eigvecs[:, long_index]
 #         angle = abs(float(np.degrees(np.arctan2(long_axis[1], long_axis[0]))))
 #         angle = min(angle, 180.0 - angle)
@@ -1210,35 +1347,30 @@ if __name__ == "__main__":
 #     def hitch_ready_for_state2(self) -> bool:
 #         return abs(self.current_hitch_angle) <= self.jackknife_recovery_target_deg
 
-#     def path_is_straight_enough(self) -> bool:
-#         if not self.path_is_recent() or self.last_path_max_deviation_px is None:
+#     def parking_y_reached_state1_retry_line(self) -> bool:
+#         if self.last_parking_center_y is None:
 #             return False
-#         return self.last_path_max_deviation_px <= self.path_straight_tolerance_px
+#         return self.last_parking_center_y <= self.state2_neutral_forward_target_parking_y
 
-#     def path_is_recent(self) -> bool:
-#         if self.last_path_seen_time is None:
-#             return False
-#         return time.time() - self.last_path_seen_time <= self.path_timeout_sec
+#     def neutral_forward_elapsed(self) -> float:
+#         if self.neutral_forward_start_time is None:
+#             return 0.0
+#         return time.time() - self.neutral_forward_start_time
 
-#     @staticmethod
-#     def path_max_deviation_px(path: List[Point]) -> Optional[float]:
-#         if len(path) < 3:
-#             return None
-#         points = np.array(path, dtype=np.float32)
-#         start = points[0]
-#         end = points[-1]
-#         line = end - start
-#         line_len = float(np.linalg.norm(line))
-#         if line_len <= 1e-6:
-#             return None
-#         offsets = points[1:-1] - start
-#         deviations = np.abs(line[0] * offsets[:, 1] - line[1] * offsets[:, 0]) / line_len
-#         return float(np.max(deviations)) if len(deviations) > 0 else 0.0
+#     def state1_to_state2_stop_elapsed(self) -> float:
+#         if self.state1_to_state2_stop_start_time is None:
+#             return 0.0
+#         return time.time() - self.state1_to_state2_stop_start_time
 
 #     def jackknife_stop_elapsed(self) -> float:
 #         if self.jackknife_stop_start_time is None:
 #             return 0.0
 #         return time.time() - self.jackknife_stop_start_time
+
+#     def jackknife_forward_elapsed(self) -> float:
+#         if self.jackknife_forward_start_time is None:
+#             return 0.0
+#         return time.time() - self.jackknife_forward_start_time
 
 #     def parking_currently_missing(self) -> bool:
 #         if self.last_parking_seen_time is None:
@@ -1252,7 +1384,13 @@ if __name__ == "__main__":
 
 #     def publish_command(self, steering: int, speed: int) -> None:
 #         target = int(round(clamp(steering * self.steering_sign, -MAX_STEP, MAX_STEP)))
-#         target = int(clamp(target, self.last_steering - self.max_step_delta, self.last_steering + self.max_step_delta))
+#         target = int(
+#             clamp(
+#                 target,
+#                 self.last_steering - self.max_step_delta,
+#                 self.last_steering + self.max_step_delta,
+#             )
+#         )
 #         self.last_steering = target
 
 #         msg = MotionCommand()
@@ -1260,6 +1398,11 @@ if __name__ == "__main__":
 #         msg.left_speed = int(speed)
 #         msg.right_speed = int(speed)
 #         self.publisher.publish(msg)
+
+#         command_signature = (target, int(speed))
+#         if command_signature != self.last_command_signature:
+#             self.last_command_signature = command_signature
+#             self.log(f"command changed: steering={target}, speed={int(speed)}")
 
 #     def complete(self, reason: str) -> None:
 #         if self.state == ParkingState.DONE:
@@ -1269,11 +1412,21 @@ if __name__ == "__main__":
 #         self.get_logger().info(f"PARKING COMPLETE: {reason}")
 
 #     def log(self, text: str) -> None:
-#         if self.show_log:
-#             self.get_logger().info(
-#                 f"[{self.state}] {text}, hitch={self.current_hitch_angle:.1f}, "
-#                 f"err_ang={self.current_heading_error:.1f}°, parking_x={self.last_parking_center_x}"
-#             )
+#         if not self.show_log:
+#             return
+
+#         log_signature = (self.state, text)
+#         if log_signature == self.last_log_signature:
+#             return
+#         self.last_log_signature = log_signature
+
+#         self.get_logger().info(
+#             f"[{self.state}] {text}, side={self.parking_side}, "
+#             f"hitch={self.current_hitch_angle:.1f}, "
+#             f"err_ang={self.current_heading_error:.1f}°, "
+#             f"parking_x={self.last_parking_center_x}, "
+#             f"parking_y={self.last_parking_center_y}"
+#         )
 
 #     def side_from_x(self, x: float) -> int:
 #         return 1 if x >= IMG_CX else -1
@@ -1291,6 +1444,7 @@ if __name__ == "__main__":
 #                 continue
 #             if float(detection.score) < self.minimum_score:
 #                 continue
+
 #             center_x = float(detection.bbox.center.position.x)
 #             center_y = float(detection.bbox.center.position.y)
 #             contour = self.detection_to_contour(detection)
@@ -1309,7 +1463,10 @@ if __name__ == "__main__":
 #     def detection_to_contour(detection) -> Optional[List[Point]]:
 #         if len(detection.mask.data) < 3:
 #             return None
-#         return [(float(point.x), float(point.y)) for point in detection.mask.data]
+#         return [
+#             (float(point.x), float(point.y))
+#             for point in detection.mask.data
+#         ]
 
 #     @staticmethod
 #     def contour_area(contour: Optional[List[Point]]) -> float:
@@ -1327,12 +1484,17 @@ if __name__ == "__main__":
 #         right = perception.get(CLS_RIGHT)
 #         if parking is None or left is None or right is None:
 #             return False
+
 #         parking_contour = parking.get("contour")
 #         if not parking_contour:
 #             return False
+
 #         left_center = (float(left["center_x"]), float(left["center_y"]))
 #         right_center = (float(right["center_x"]), float(right["center_y"]))
-#         return self.point_inside_polygon(left_center, parking_contour) and self.point_inside_polygon(right_center, parking_contour)
+#         return (
+#             self.point_inside_polygon(left_center, parking_contour)
+#             and self.point_inside_polygon(right_center, parking_contour)
+#         )
 
 #     @staticmethod
 #     def point_inside_polygon(point: Point, polygon: List[Point]) -> bool:
@@ -1365,9 +1527,10 @@ if __name__ == "__main__":
 #         except Exception:
 #             pass
 #         node.destroy_node()
-#         if rclpy.ok():
-#             rclpy.shutdown()
+#         rclpy.shutdown()
 
 
 # if __name__ == "__main__":
 #     main()
+
+

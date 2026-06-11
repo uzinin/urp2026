@@ -29,6 +29,7 @@ setup(
             'parking_motion_planner_ver2_node = decision_making_pkg.parking_motion_planner_ver2_node:main',
             'ltb_parking_controller_node = decision_making_pkg.ltb_parking_controller_node:main',
             'curved_parking_node = decision_making_pkg.curved_parking_node:main',
+            'ver2_curved_parking_node = decision_making_pkg.ver2_curved_parking_node:main',
         ],
     },
 )
